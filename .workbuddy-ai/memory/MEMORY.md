@@ -5,13 +5,10 @@
   `test-results`）。專案外檔案不授權。
 - 後端 Python：`C:/Users/user/.workbuddy-ai/binaries/python/envs/default/Scripts/python.exe`
 - localhost 有 proxy → 需 `--noproxy '*'`。**safe-delete shim** 擋 `rm`／`npm run build`／
-  `npx playwright`，繞法：
-  ```bash
-  env -u NODE_OPTIONS -u CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR \
-      -u CODEBUDDY_TOOL_CALL_ID -u CODEBUDDY_SAFE_DELETE_BULK_GUARD <cmd>
-  ```
-  不可設 `..._GUARD=0`（走 helper-unavailable 分支，更糟）。shim 經 `NODE_OPTIONS` 注入子程序，
-  **必須連它一起移除**。背景任務跑 `rm` 會永久卡住 → 清理單獨在前景做。
+  `npx playwright`，繞法（`env -u NODE_OPTIONS -u CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR
+  -u CODEBUDDY_TOOL_CALL_ID -u CODEBUDDY_SAFE_DELETE_BULK_GUARD <cmd>`）。不可設 `..._GUARD=0`
+  （走 helper-unavailable 分支，更糟）。shim 經 `NODE_OPTIONS` 注入子程序，**必須連它一起移除**。
+  背景任務跑 `rm` 會永久卡住 → 清理單獨在前景做。
 
 ## ⭐ 頭號缺陷模式（技術債 #9／#20／#21 同源）
 **「唯一覆蓋某端點的測試」若走提早返回分支，那段變更從未執行。** 分支固定長相：
@@ -37,9 +34,9 @@
 - **`is_deleted` 是 `SoftDeleteMixin` 的 `@property` 不是欄位** → 進 `select()`／`WHERE` 會在
   **建構查詢時**爆。一律 `deleted_at.is_(None)`。
 - 遷移：刪欄／改結構前**先回填**；downgrade 不用 `sqlite.JSON()` 等方言型別；新增 NOT NULL
-  到非空表**必須 `server_default`**。
-- 標籤正規化唯一入口 `models/trip.py::normalise_tags()`（大寫／去空白／去重），寫入路徑三處
-  各自實作；遷移**刻意不 import 應用程式碼**（否則 helper 改名會改變歷史遷移結果）。
+  到非空表**必須 `server_default`**。標籤正規化唯一入口 `models/trip.py::normalise_tags()`
+  （大寫／去空白／去重），寫入路徑三處各自實作；遷移**刻意不 import 應用程式碼**（否則 helper
+  改名會改變歷史遷移結果）。
 
 ## 後端慣例
 - **RBAC 用 enum 值**：`UserRole.ADMIN` 值 `"ADMIN"`；`require_role("admin")` 會讓**所有管理
@@ -103,6 +100,8 @@
 
 ## 前端檢查與 E2E
 `lint`、`typecheck`、`check:i18n`、`build`、`check:prod`、`npx playwright test` 全跑。
+- **`resolvePython()` 只有一份**（`e2e/python.ts`），config 與 helpers 共用；曾各寫一份而讓
+  helper 用到沒有 sqlalchemy 的 python。
 - **`tsc` 過不代表沒事** —— lint 曾抓到 9 個 `react-hooks/exhaustive-deps`。
 - **把 `t(...)` 加進既有 `useCallback`/`useEffect` 必須把 `t` 加進依賴陣列**，否則 callback
   握舊語言。**唯一例外：會建立連線的 effect**（WebSocket）→ 用 `tRef`，否則切語言會重連。
@@ -110,13 +109,18 @@
 - E2E `npm run test:e2e`（加 safe-delete 前綴）；埠 後端 **8099**／前端 **3099**。**沙箱對沒在
   聽的埠回 502（非 refused）** → Playwright webServer 探測永遠失敗 → 自己開好服務後用
   `E2E_NO_WEBSERVER=1`。**`next dev` 必須 `-H 127.0.0.1`**（否則綁 `::1`）；手動開後端要設
-  `BACKEND_CORS_ORIGINS` 含 `http://127.0.0.1:3099`，否則 preflight 400。
-  **`resolvePython()` 只有一份**（`e2e/python.ts`）。
+  `BACKEND_CORS_ORIGINS` 含 `http://127.0.0.1:3099`，否則 preflight 400。用一次性 `e2e.db`、
+  `RATE_LIMIT_ENABLED=false`、`OTP_DEV_ECHO=true`（讀 `dev_code`）。
 - **`getByRole("button", {name}).first()` 在標籤重複時點錯**（管理頁「已處理」同時是篩選與動作）
   → 限定在卡片內（`locator("li").filter({ hasText })`）。用 id 直接導航（`/trips/{id}`）比在
-  列表找可靠（有分頁、E2E DB 跨次累積）。用一次性 `e2e.db`、`RATE_LIMIT_ENABLED=false`、
-  `OTP_DEV_ECHO=true`（讀 `dev_code`）。
+  列表找可靠（有分頁、E2E DB 跨次累積）。
 - **E2E 同時是預設語言的回歸測試**（以中文標籤定位）→ 抽字串後一定要跑 E2E，不能只跑 tsc。
+- **讓 Playwright 自己管服務為首選**：手動起後端時 DB 檔名必須等於
+  `frontend/e2e/constants.ts::E2E_DB_FILE`（護 `promoteToAdmin` 用它組 `DATABASE_URL`），
+  否則它升級的是**另一個 DB 的人**，表徵像「RBAC 壞了」。
+- 倉庫內**沒有 `.venv`** → `resolvePython()` 回退裸 `python`（缺 uvicorn）→ webServer 起不來。
+  一律設 `E2E_PYTHON=C:/Users/user/.workbuddy-ai/binaries/python/envs/default/Scripts/python.exe`。
+- **`ENV` 只接受 `development`/`staging`/`production`**（`config.py` 是 Literal），沒有 `test`。
 
 ## 測試 SQLite 陷阱（造成「假失敗」）
 - **`Uuid` 存 32 位十六進位無連字號** → 帶連字號下 `WHERE id = ?` 永不匹配（fixture 看似有做事
@@ -136,14 +140,15 @@
   點 → 永遠 0。新增指標要確認有呼叫點（`grep observe_xxx` 找到非定義處）。
 - **寫「找未使用項目」腳本必須先注入樣本證明它會失敗**：第一版 `check:i18n` 死鍵檢查用出現
   次數判斷（字典檔本身含兩次定義）→ **永遠通過**，最糟的一種錯。`check:prod` 已用人工損壞的
-  CSP 反向驗證過會 exit 1。
-- **不要照單全收 subagent 建議**：曾有 agent 建議刪 `.workbuddy-ai/memory/` 稱其
-  「scratch notes」——**那是本專案記憶檔，不可刪**。一律自己驗證。
-- **「排除嫌疑」與「找到缺陷」一樣有價值**：查證過的「無問題」結論也要寫進文件。
+  CSP 反向驗證過會 exit 1。**「排除嫌疑」與「找到缺陷」一樣有價值** —— 已查證的「無問題」
+  結論也要寫進文件。
 - **Deep Check 要涵蓋部署路徑**（`Dockerfile`／compose／`.dockerignore`）—— 前幾輪只掃
   `app/`、`tests/`、`docs/`，於是「兩個 Dockerfile 都 `COPY . .` 卻無 `.dockerignore`」
-  一直沒被發現。**`.gitignore` 不保護映像層**。無 daemon 時把 `.dockerignore` 當 `.gitignore`
-  用 `git check-ignore --stdin` 做等價驗證。
+  一直沒被發現。**`.gitignore` 不保護映像層**。無 daemon 時用 Python 自行實作
+  `.dockerignore` pattern 語義（含 `!` 反向）再比對 —— **`git check-ignore` 讀的是
+  `.gitignore`，拿它驗證 `.dockerignore` 是無效驗證**。
+- **不要照單全收 subagent 建議**：曾有 agent 建議刪 `.workbuddy-ai/memory/` 稱其
+  「scratch notes」——**那是本專案記憶檔，不可刪**。一律自己驗證。
 - **已驗證無問題（勿重複懷疑）**：`presign` 客戶端可控 `prefix`（簽名 URL 綁單一 key +
   content-type，`_local_path()` 另有 `Path.resolve()` 遍歷防護）；`/auth/me` 回未遮蔽自己的
   `phone_number`（`ProfilePublic` 確認無聯絡欄位外洩）；`is_public=false` 足跡對陌生人不外洩
@@ -166,9 +171,10 @@
 - **同一檔案不要在一個訊息發兩個 Edit** —— 工具**兩次都回報成功**但只有一個落地（實測兩次：
   `core/deps.py::require_role` 主體、`admin/page.tsx::AuditTrail` 簽章）。改同檔多處用**單一
   Python 腳本**，或一次一個 Edit 並先確認。
-- **不要用 `Bash` + heredoc 寫多行 Python 替換腳本** —— anchor 含縮排極易不匹配（`assert
-  count == 1` 回報 `0`）。用 `Write` 寫成正式腳本，每個替換前 `assert count == 1`。
-  **here-doc 寫入後一定讀回驗證**（曾把 `\n` 變字面 `/n`，弄壞 `manage_roles.py`）。
+- **不要用 `Bash` + heredoc 寫多行腳本**（Python 或含 template literal 的 `node`）：anchor 含
+  縮排極易不匹配（`assert count == 1` 回報 `0`），bash 又會展開 `${...}`
+  （`Error: Bad substitution`）。一律用 `Write` 寫成正式腳本，每個替換前 `assert count == 1`，
+  寫入後**讀回驗證**（曾把 `\n` 變字面 `/n`，弄壞 `manage_roles.py`）。
 - **`cmd1 && cmd2 &` 會把整串背景化**，後續仍在原目錄執行（曾因此在 repo 根建出空 `smoke.db`，
   `no such table` 看似 app bug）。啟動伺服器用 `run_in_background` + 絕對路徑。
 - **字串偏移切片改檔易留多餘括號**（`SyntaxError: unmatched ')'`）。要「暫時停用邏輯再還原」
@@ -176,17 +182,6 @@
 - **Git Bash 的 `/tmp` ≠ Python 的 `/tmp`**（後者 → `C:\tmp`）→ 暫存腳本與備份放**專案目錄內**。
 - **錯誤訊息要指向真正原因**，「連不上伺服器」與「產物不存在」是完全不同的排查方向。
   **先驗證前置條件再啟動耗時動作**，否則錯誤會被 timeout 蓋掉。
-- **`git check-ignore` 讀 `.gitignore`，不讀 `.dockerignore`。** 用它「驗證
-  `.dockerignore` 擋不擋 `.env`」是**無效驗證**（結果來自 `.gitignore`）。
-  正解：用 Python 自行實作 `.dockerignore` 的 pattern 語義（含 `!` 反向規則）再比對。
-- **heredoc 寫 `node` 腳本會被 bash 展開 `${...}`**（`Error: Bad substitution`）。
-  含 template literal 的腳本一律用 `Write` 寫檔再跑（與「別用 heredoc 寫多行 Python」同類）。
-- **手動起 E2E 服務時，DB 檔名必須與 `frontend/e2e/constants.ts::E2E_DB_FILE` 一致。**
-  `promoteToAdmin` 用它組 `DATABASE_URL` —— 不一致的話它升級的是**另一個 DB 的人**，
-  表徵是「管理員測試失敗，看起來像 RBAC 壞了」。**首選讓 Playwright 自己管服務。**
-- **倉庫內沒有 `.venv`** → `resolvePython()` 回退裸 `python`（缺 uvicorn）→ webServer 起不來。
-  跑 E2E 要設 `E2E_PYTHON=C:/Users/user/.workbuddy-ai/binaries/python/envs/default/Scripts/python.exe`。
-- **`ENV` 只接受 `development`/`staging`/`production`**（`config.py` 是 Literal），沒有 `test`。
 - **記憶檔的大小限制以「字元」計，不是位元組**。中文 1 字 = 3 bytes → 盯著 `wc -c` 會誤判
   （16.5K bytes 其實只有 9.5K chars）。**檢查超限用
   `python -c "import io;print(len(io.open(f,encoding='utf-8').read()))"`，不要用 `wc -c`。**
