@@ -176,6 +176,17 @@
 - **Git Bash 的 `/tmp` ≠ Python 的 `/tmp`**（後者 → `C:\tmp`）→ 暫存腳本與備份放**專案目錄內**。
 - **錯誤訊息要指向真正原因**，「連不上伺服器」與「產物不存在」是完全不同的排查方向。
   **先驗證前置條件再啟動耗時動作**，否則錯誤會被 timeout 蓋掉。
+- **`git check-ignore` 讀 `.gitignore`，不讀 `.dockerignore`。** 用它「驗證
+  `.dockerignore` 擋不擋 `.env`」是**無效驗證**（結果來自 `.gitignore`）。
+  正解：用 Python 自行實作 `.dockerignore` 的 pattern 語義（含 `!` 反向規則）再比對。
+- **heredoc 寫 `node` 腳本會被 bash 展開 `${...}`**（`Error: Bad substitution`）。
+  含 template literal 的腳本一律用 `Write` 寫檔再跑（與「別用 heredoc 寫多行 Python」同類）。
+- **手動起 E2E 服務時，DB 檔名必須與 `frontend/e2e/constants.ts::E2E_DB_FILE` 一致。**
+  `promoteToAdmin` 用它組 `DATABASE_URL` —— 不一致的話它升級的是**另一個 DB 的人**，
+  表徵是「管理員測試失敗，看起來像 RBAC 壞了」。**首選讓 Playwright 自己管服務。**
+- **倉庫內沒有 `.venv`** → `resolvePython()` 回退裸 `python`（缺 uvicorn）→ webServer 起不來。
+  跑 E2E 要設 `E2E_PYTHON=C:/Users/user/.workbuddy-ai/binaries/python/envs/default/Scripts/python.exe`。
+- **`ENV` 只接受 `development`/`staging`/`production`**（`config.py` 是 Literal），沒有 `test`。
 - **記憶檔的大小限制以「字元」計，不是位元組**。中文 1 字 = 3 bytes → 盯著 `wc -c` 會誤判
   （16.5K bytes 其實只有 9.5K chars）。**檢查超限用
   `python -c "import io;print(len(io.open(f,encoding='utf-8').read()))"`，不要用 `wc -c`。**
@@ -183,11 +194,18 @@
   慣例不一致（`_` 前綴），很容易在這種一次性場合把臨時產物 commit 進去，之後要清就得改寫歷史。
 
 ## 仍開放（已記錄取捨，非缺陷）
-- 技術債 #3（Redis 故障時限流退記憶體）、#5（`crypto.py` 預留）、#6（WS 狀態單程序）、
-  #7（無前端狀態庫）、#8（雜湊線程池為每程序上限）—— **全是「多副本部署前」才需處理**。
-- **#21 殘留 TOCTOU**：接受申請的容量檢查併發下可雙雙通過 —— 與 #3/#6/#8 同源，應**一次性
-  設計**，不要逐項打補丁。
-- P3 行程地圖：**需先決定合規圖資**，不應由實作端決定。
+- **多副本前置清單（README 技術債 #22 / `STATUS.md` §4.1）**：目前**單副本**部署
+  （`docker-compose` 單實例、`CMD` 無 `--workers`），全部不觸發。一旦水平擴展要**一起**處理：
+  #6 WS 單程序（最嚴重，訊息單向丟失）→ #3 限流退記憶體 → #8 雜湊池每程序上限 →
+  #21 TOCTOU 超收 → **#22a `kv.py` 斷路器是模組級變數**（Redis 故障時每副本各學一次）→
+  **#22b `app.seed` 啟動時執行**（多副本同時 seed 競態）。
+  ⚠️ **`uvicorn --workers N` 就是多行程，#6 已經觸發** —— 別以為「還沒上 K8s 就安全」。
+- **P3 行程地圖**：**選型已定 Leaflet**（非 MapLibre；只需標點連線，不需 WebGL；
+  BSD-2-Clause）。圖磚用 OSM，流量大再換 CDN／自架。**不用天地圖**（唯一優勢是境內合規，
+  本 App 非境內使用，且其條款以境內主體為前提）。
+  **真正的阻塞點是隱私規則**：`models/trip.py` 只存國家／城市自由文字、**無座標**，
+  且 §2.2 明訂寬度粗化是合規要求。加經緯度 = 提高精度 = 衝突 → 須先決定
+  「放寬」或「改存城市中心點」。其次是地理編碼（歧義／查不到／亂填）。**不是接圖層那麼簡單。**
 - 這些不是「待修 bug」，是**已量測並記錄的架構取捨**。要動前先讀 README 對應技術債條目。
-- **此 repo 目前無任何 commit**（`git log` → `does not have any commits yet`）。`.gitignore`
-  已驗證正確（忽略 `.env`／`*.db`，保留 `.env.example`）。
+- **此 repo 已有 commit**（首個 `00bd6f9`）。`.gitignore` 已驗證正確
+  （忽略 `.env`／`*.db`，保留 `.env.example`）。
