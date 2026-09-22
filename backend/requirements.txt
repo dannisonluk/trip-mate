@@ -1,0 +1,39 @@
+# Trip Mate — backend dependencies
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# Async ORM stack (spec: SQLAlchemy 2.0 Async)
+sqlalchemy==2.0.35
+greenlet==3.1.1            # required by SQLAlchemy's async bridge
+asyncpg==0.30.0            # PostgreSQL async driver (runtime)
+aiosqlite==0.20.0          # SQLite async driver (local dev / tests)
+psycopg[binary]==3.2.3     # sync driver, used by Alembic migrations
+alembic==1.13.3
+
+pydantic==2.9.2
+pydantic-settings==2.5.2
+email-validator==2.2.0
+
+# Auth / crypto
+python-jose[cryptography]==3.3.0
+argon2-cffi==23.1.0
+
+# Rate limiting / cache / OTP storage
+slowapi==0.1.9
+redis==5.0.8
+
+# Observability — /metrics in Prometheus text format (optional at runtime:
+# the endpoint is simply not mounted if the package is absent).
+prometheus-client==0.21.0
+
+# Storage / media
+boto3==1.35.36
+Pillow==10.4.0
+
+# Uploads
+python-multipart==0.0.12
+
+# Dev / test
+httpx==0.27.2
+pytest==8.3.3
+pytest-asyncio==0.24.0

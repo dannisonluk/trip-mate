@@ -1,0 +1,45 @@
+# Keep secrets and build noise out of the image.
+#
+# `COPY . .` in the Dockerfile means this file is the only thing standing between
+# the build context and the image. Two concrete consequences of getting it wrong:
+#
+#   * A real `.env` would be baked into a layer. Deleting it in a later RUN does
+#     not help — image history keeps every layer, so `docker history` would still
+#     reveal it. `.gitignore` protects the repo; it does NOT protect the image.
+#   * Local virtualenvs / caches would be copied in and then shadowed by the
+#     installed packages, which is both slow and a source of "works on my
+#     machine" divergence (e.g. a stale .pyc winning over new source).
+
+# --- Secrets ---
+.env
+.env.*
+*.env
+!.env.example
+
+# --- Python environment & caches ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Local data ---
+*.db
+*.sqlite3
+var/
+uploads/
+
+# --- VCS / tooling ---
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose*.yml
+
+# --- Docs & tests (not needed to run the service) ---
+tests/
+docs/
+README.md

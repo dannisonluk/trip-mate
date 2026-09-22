@@ -1,0 +1,40 @@
+# Keep secrets and build noise out of the image.
+#
+# The frontend Dockerfile runs `COPY . .` after `npm install`, so anything not
+# ignored here ends up in the image. Measured locally, that is:
+#   node_modules  ~638 MB   (would be shadowed by the image's own install anyway)
+#   .next         ~176 MB   (a stale local build, guaranteed to mislead)
+#
+# More seriously, a real `.env.local` would be baked into a layer. Deleting it in
+# a later RUN does not remove it from image history. `.gitignore` protects the
+# repo; it does NOT protect the image.
+
+# --- Secrets ---
+.env
+.env.*
+*.env
+!.env.example
+!.env.local.example
+
+# --- Dependencies & build output ---
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# --- Test artifacts ---
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# --- VCS / tooling ---
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose*.yml
+
+# --- Docs ---
+README.md

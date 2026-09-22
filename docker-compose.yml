@@ -1,0 +1,74 @@
+# Trip Mate — local development stack
+# Usage:  docker compose up --build
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tripmate
+      POSTGRES_PASSWORD: tripmate
+      POSTGRES_DB: tripmate
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tripmate"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./backend
+    environment:
+      ENV: development
+      # MUST use the async driver — the app engine is AsyncEngine.
+      # Alembic derives its sync URL (psycopg) from this automatically.
+      DATABASE_URL: postgresql+asyncpg://tripmate:tripmate@db:5432/tripmate
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-only-secret-change-me
+      BACKEND_CORS_ORIGINS: http://localhost:3000
+      STORAGE_BACKEND: local
+      LOCAL_UPLOAD_DIR: /app/var/uploads
+      # Development only: return the SMS OTP in the API response.
+      OTP_DEV_ECHO: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - uploads:/app/var/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "python -m app.seed || true;
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  web:
+    build: ./frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  uploads:
