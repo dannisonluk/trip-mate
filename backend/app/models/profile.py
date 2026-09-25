@@ -65,6 +65,15 @@ class TravelHistory(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     country: Mapped[str] = mapped_column(String(80), nullable=False)
     city: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
+    #: Canonical city for this past trip. Mirrors `TripPost.city_id`: the free
+    #: text `city` is what renders, and this id is what makes the value
+    #: verifiable. It matters more here than on a trip post, because this field
+    #: feeds the matching engine — an unverifiable spelling ("Osaka" vs "osaka"
+    #: vs a typo) silently fails to match, and the user has no way to see why.
+    city_id: Mapped[int | None] = mapped_column(
+        ForeignKey("cities.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+
     start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 

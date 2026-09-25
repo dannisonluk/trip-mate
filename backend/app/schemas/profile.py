@@ -18,6 +18,11 @@ class TravelHistoryCreate(BaseModel):
     country: str = Field(min_length=1, max_length=80)
     # Coarse location only — never a street address (§2.2).
     city: str | None = Field(default=None, max_length=80)
+    #: Reference-table id for `city`. The authoritative half of the pair: `city`
+    #: is only ever the display echo of this value. Validated against `cities`
+    #: before it is stored, because an unverifiable id is the same defect as an
+    #: unverifiable spelling — the row would look fine and never match.
+    city_id: int | None = Field(default=None, ge=1)
     start_date: date | None = None
     end_date: date | None = None
     budget_type: BudgetType = BudgetType.MODERATE

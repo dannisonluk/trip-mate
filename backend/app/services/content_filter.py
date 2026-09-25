@@ -74,6 +74,36 @@ class Verdict:
 
 ALLOW = Verdict("ALLOW")
 
+
+@dataclass(frozen=True)
+class Rejection:
+    """The client-safe reason a write was refused — a code, never a sentence.
+
+    Rendered text would freeze one language into the response: the caller may be
+    reading in English while the server's literals are Traditional Chinese. The
+    client resolves `code` through its own dictionary and interpolates `params`.
+
+    `params` values are themselves **codes or scalars**, never prose — the same
+    language-neutrality argument applies one level down.
+    """
+
+    code: str
+    params: dict | None = None
+
+    def as_detail(self) -> dict:
+        """The shape FastAPI puts in `HTTPException.detail`.
+
+        A mapping rather than a string so a client can branch on the code
+        without parsing prose. FastAPI serialises a non-str `detail` verbatim
+        into `{"detail": {...}}`, which is exactly the contract the frontend
+        already reads for validation errors.
+        """
+        payload: dict = {"code": self.code}
+        if self.params:
+            payload["params"] = self.params
+        return payload
+
+
 # --- normalisation ---------------------------------------------------------
 
 # Zero-width and bidi-control characters: invisible, so `pro\u200bstitute` reads
@@ -241,9 +271,13 @@ async def _review_webhook(text: str, field: str) -> Verdict | None:
         if not settings.CONTENT_FILTER_FAIL_OPEN:
             # Documented as off by default. Failing closed turns a vendor outage
             # into a total write outage, which is a much larger incident.
+            #
+            # A code, not a sentence — see `Rejection`. The status already tells
+            # the client this is a retryable outage; the code tells it what to
+            # say about it.
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="內容審核服務暫時無法使用，請稍後再試。",
+                detail={"code": "content_filter_unavailable"},
             ) from exc
         logger.warning(
             "content_moderation_provider_failed",
@@ -268,20 +302,29 @@ async def _review_webhook(text: str, field: str) -> Verdict | None:
 
 # --- public API ------------------------------------------------------------
 
-#: The client sees this and only this. Naming the rule would let a determined
-#: user iterate against the filter; naming the *field* is safe and actually helps
-#: a legitimate user find the box they need to edit.
-_REJECTION_DETAIL = "這段內容含有不符合社群規範的資訊，請修改後再試。"
+#: Why a write was refused — a **code**, not a sentence.
+#:
+#: The client resolves it through its own dictionary. Sending Traditional Chinese
+#: from here meant an English-locale user got a Chinese error on every rejected
+#: write, and `check:i18n` could not see it because that script only scans
+#: frontend sources. See `docs/AUDIT-2026-09-26.md` (B6).
+#:
+#: The code names the *category* and never the rule that matched: naming the rule
+#: would let a determined user iterate against the filter one rejection at a
+#: time.
+REJECTION_CODE = "content_rejected"
 
-#: Field name -> the label a user would recognise from the form they just filled.
-_FIELD_LABELS = {
-    "title": "標題",
-    "description": "行程說明",
-    "nickname": "暱稱",
-    "bio": "個人簡介",
-    "comment": "評價內容",
-    "content": "訊息",
-    "summary": "足跡摘要",
+#: Field name -> the code for the box the user has to go and edit. The client
+#: turns it into "Trip description" / "行程說明". Naming the *field* is safe and
+#: actually helps a legitimate user find what to change.
+_FIELD_CODES = {
+    "title": "content_field.title",
+    "description": "content_field.description",
+    "nickname": "content_field.nickname",
+    "bio": "content_field.bio",
+    "comment": "content_field.comment",
+    "content": "content_field.message",
+    "summary": "content_field.summary",
 }
 
 
@@ -305,15 +348,16 @@ async def moderate(text: str, *, field: Field) -> Verdict:
 
 async def screen(
     text: str, *, field: Field, label: str | None = None
-) -> tuple[Verdict, str | None]:
+) -> tuple[Verdict, Rejection | None]:
     """Moderate and record the outcome. Never raises.
 
-    Returns `(verdict, rejection_detail)`; `rejection_detail` is non-None only for
-    a `BLOCK`, and is the client-safe message.
+    Returns `(verdict, rejection)`; `rejection` is non-None only for a `BLOCK`,
+    and is the **structured** client-safe reason — a code plus params, never a
+    rendered sentence (see `REJECTION_CODE`).
 
     Split out from `enforce` so a non-HTTP caller can reject in its own idiom.
     The WebSocket path is the reason this exists: `HTTPException` has no meaning
-    on a socket, so that caller needs the verdict and the message separately in
+    on a socket, so that caller needs the verdict and the reason separately in
     order to send an error frame it can actually render.
 
     Rejections are counted and logged but deliberately **not** written to the
@@ -337,7 +381,10 @@ async def screen(
                 "text_length": len(text),
             },
         )
-        return verdict, f"{label}：{_REJECTION_DETAIL}" if label else _REJECTION_DETAIL
+        return verdict, Rejection(
+            code=REJECTION_CODE,
+            params={"field": label} if label else None,
+        )
 
     if verdict.action == "FLAG":
         metrics.observe_content_flagged(field, verdict.reason or "unknown")
@@ -351,10 +398,11 @@ async def screen(
 
 async def enforce(text: str, *, field: Field, label: str | None = None) -> Verdict:
     """Moderate `text` and raise 422 if it must be rejected."""
-    verdict, detail = await screen(text, field=field, label=label)
-    if detail is not None:
+    verdict, rejection = await screen(text, field=field, label=label)
+    if rejection is not None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=rejection.as_detail(),
         )
     return verdict
 
@@ -362,10 +410,11 @@ async def enforce(text: str, *, field: Field, label: str | None = None) -> Verdi
 async def enforce_many(*, field: Field, **texts: str | None) -> None:
     """Enforce over several named fields, naming the offending one in the error.
 
-    The field *label* is included because the user can act on it ("行程說明：…");
-    the rule that matched still is not.
+    The field is passed as a **code** (`content_field.description`), so the
+    client renders it in the reader's own language; the rule that matched still
+    is not disclosed.
     """
     for name, value in texts.items():
         if not value:
             continue
-        await enforce(value, field=field, label=_FIELD_LABELS.get(name, name))
+        await enforce(value, field=field, label=_FIELD_CODES.get(name, name))

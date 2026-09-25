@@ -13,6 +13,8 @@ varying the trip id on each request — each one attached to a trip neither part
 had been on. The existing test missed it because it always reused the *same*
 `trip_post_id`, which the duplicate guard does catch.
 """
+import sqlite3
+
 import pytest
 
 
@@ -255,3 +257,82 @@ def test_unknown_profile_id_is_404_on_both_review_reads(client, register_user):
         f"/api/v1/profiles/{missing}/reviews/summary",
     ):
         assert client.get(path, headers=viewer["headers"]).status_code == 404
+
+
+# --- a pre-existing duplicate must not brick the endpoint (B1) --------------
+
+
+def test_duplicate_rows_in_the_table_still_yield_409_not_500(
+    client, register_user, raw_db
+):
+    """The defect: `.scalar_one_or_none()` raises on *two* matching rows.
+
+    That is reachable without any attack, because SQL treats NULLs as distinct,
+    so the `(reviewer, reviewee, trip_post_id)` unique constraint lets two
+    `trip_post_id IS NULL` rows through. Once a duplicate existed, every
+    subsequent submission for that pair raised `MultipleResultsFound` and
+    returned 500 — a permanently wedged endpoint that no request could clear.
+
+    The partial unique index added in this change prevents new duplicates, but a
+    database that already has them (or was written before the index existed)
+    must still answer correctly, so the read is pinned directly.
+    """
+    alice = register_user(nickname="Alice")
+    bob = register_user(nickname="Bob")
+    trip = _make_trip(client, alice)
+    _apply_and_decide(client, trip, bob, alice, "ACCEPTED")
+
+    assert _review(client, bob, alice, rating=4).status_code == 201
+
+    # Simulate the legacy/pre-index state the application cannot produce any
+    # more: a second untripped review for the same ordered pair. Written with raw
+    # SQL because the index correctly rejects it through the ORM.
+    raw_db.execute(
+        "INSERT INTO reviews (id, reviewer_id, reviewee_id, trip_post_id, rating, tags,"
+        " created_at, updated_at) "
+        "SELECT lower(hex(randomblob(16))), reviewer_id, reviewee_id, NULL, 1, '[]',"
+        " created_at, updated_at FROM reviews LIMIT 1"
+    )
+    raw_db.commit()
+
+    resp = _review(client, bob, alice, rating=5)
+    assert resp.status_code == 409, resp.text
+    assert "already" in resp.json()["detail"].lower()
+
+
+def test_the_partial_index_rejects_new_untripped_duplicates(
+    client, register_user, raw_db
+):
+    """The constraint itself, not the courtesy `SELECT`, is the guard.
+
+    A pre-check cannot see a concurrent insert, so the invariant has to hold at
+    the database. This asserts the index exists with the `IS NULL` predicate
+    *and* that it actually blocks a direct insert — an index created without the
+    `WHERE` clause would silently forbid a pair from reviewing each other once
+    per shared trip too.
+    """
+    alice = register_user(nickname="Alice")
+    bob = register_user(nickname="Bob")
+    trip = _make_trip(client, alice)
+    _apply_and_decide(client, trip, bob, alice, "ACCEPTED")
+    assert _review(client, bob, alice, rating=4).status_code == 201
+
+    row = raw_db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+        ("uq_review_once_per_untripped_pair",),
+    ).fetchone()
+    assert row is not None, "the partial unique index was never created"
+    assert "WHERE trip_post_id IS NULL" in row[0], row[0]
+
+    # A *tripped* review for the same pair is a different key and stays legal.
+    assert _review(client, bob, alice, trip_post_id=trip["id"], rating=5).status_code == 201
+
+    # A second untripped one is not.
+    with pytest.raises(sqlite3.IntegrityError):
+        raw_db.execute(
+            "INSERT INTO reviews (id, reviewer_id, reviewee_id, trip_post_id, rating,"
+            " tags, created_at, updated_at) "
+            "SELECT lower(hex(randomblob(16))), reviewer_id, reviewee_id, NULL, 1, '[]',"
+            " created_at, updated_at FROM reviews WHERE trip_post_id IS NULL LIMIT 1"
+        )
+

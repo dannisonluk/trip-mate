@@ -88,8 +88,19 @@ class TripPostTag(Base):
 class TripPost(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """An invitation to find travel companions.
 
-    Location granularity is deliberately coarse (country + city only) to honour
+    Location granularity is deliberately coarse — country plus city — to honour
     the precise-location privacy rule (Security Spec §2.2).
+
+    `destination_city` is a display string and `city_id` is the canonical
+    reference. Both are kept because they answer different questions:
+    `destination_city` is what the card renders, and it survives even if a city
+    is later removed from the reference table; `city_id` is what makes the city
+    *verifiable* — it is the only value a client cannot invent, and it is where
+    the map layer gets its coordinates.
+
+    There is no coordinate column here on purpose. Coordinates are joined from
+    `cities`, so this table cannot hold a precise location even if a future
+    endpoint tried to write one.
     """
 
     __tablename__ = "trip_posts"
@@ -103,6 +114,14 @@ class TripPost(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     destination_country: Mapped[str] = mapped_column(String(80), nullable=False)
     destination_city: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+    #: Canonical city. `SET NULL`, not `CASCADE`: a trip is not *about* the city
+    #: row, and re-importing GeoNames must never delete trips. Nullable because
+    #: the field is optional, and because `destination_city` may be set to a
+    #: legacy free-text value that has no matching row.
+    city_id: Mapped[int | None] = mapped_column(
+        ForeignKey("cities.id", ondelete="SET NULL"), index=True, nullable=True
+    )
 
     start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     end_date: Mapped[date | None] = mapped_column(Date, nullable=True)

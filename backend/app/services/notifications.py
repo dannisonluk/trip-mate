@@ -56,13 +56,20 @@ async def create(
     *,
     recipient_profile_id: uuid.UUID,
     type: NotificationType,
-    title: str,
+    code: str,
+    params: dict | None = None,
     body: str | None = None,
     actor_profile_id: uuid.UUID | None = None,
     trip_post_id: uuid.UUID | None = None,
     chat_room_id: uuid.UUID | None = None,
 ) -> Notification | None:
     """Create one notification. Returns None if it was suppressed.
+
+    `code` is a language-neutral key the client resolves through its own
+    dictionary; `params` carries the values to interpolate. **Never pass a
+    rendered sentence as `code`** — the row outlives the request that wrote it,
+    and a sentence baked in at write time reads wrong for every user whose
+    locale differs from the writer's.
 
     Does **not** commit — the caller owns the transaction, so a notification is
     written atomically with the action that caused it. A notification for an
@@ -77,7 +84,8 @@ async def create(
     notification = Notification(
         recipient_profile_id=recipient_profile_id,
         type=type,
-        title=title,
+        code=code,
+        params=params,
         body=body,
         actor_profile_id=actor_profile_id,
         trip_post_id=trip_post_id,
@@ -105,16 +113,21 @@ async def notify_new_message(
 
     `room_label` is the group name for TRIP rooms; pass None for DIRECT rooms,
     where naming the room after the sender would just read "Alice in Alice".
+
+    Two codes rather than one with a conditional label, because the presence of
+    the room name changes the sentence's shape ("Alice in 「Tokyo trip」" vs
+    "Alice"), not just a substituted word.
     """
     if actor_profile_id == recipient_profile_id:
         return None
     if await _blocked_between(db, actor_profile_id, recipient_profile_id):
         return None
 
-    title = (
-        f"{actor_nickname} 在「{room_label}」傳送訊息"
+    code = "chat.new_message_in_room" if room_label else "chat.new_message"
+    params = (
+        {"actor": actor_nickname, "room": room_label}
         if room_label
-        else f"{actor_nickname} 傳送了一則訊息"
+        else {"actor": actor_nickname}
     )
 
     preview = content.strip()
@@ -135,7 +148,8 @@ async def notify_new_message(
     if existing is not None:
         # Refresh in place: newest sender + newest preview, still one badge.
         existing.actor_profile_id = actor_profile_id
-        existing.title = title
+        existing.code = code
+        existing.params = params
         existing.body = preview
         return existing
 
@@ -143,7 +157,8 @@ async def notify_new_message(
         db,
         recipient_profile_id=recipient_profile_id,
         type=NotificationType.NEW_MESSAGE,
-        title=title,
+        code=code,
+        params=params,
         body=preview,
         actor_profile_id=actor_profile_id,
         chat_room_id=chat_room_id,

@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from sqlalchemy import select, update
 
 from app.core.deps import CurrentProfile, CurrentUser, DbSession
+from app.core.rate_limit import WRITE_RATE, limit
 from app.core.security import hash_password_async, verify_password_async
 from app.models.chat import ChatMessage, ChatRoomMember
 from app.models.enums import AuditAction
@@ -18,6 +19,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
+@limit(WRITE_RATE)
 async def delete_my_account(
     payload: AccountDeleteRequest,
     request: Request,

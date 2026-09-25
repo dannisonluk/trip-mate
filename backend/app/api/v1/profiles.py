@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 from app.core.config import settings
 from app.core.deps import CurrentProfile, CurrentUser, DbSession
 from app.core.rate_limit import WRITE_RATE, limit
+from app.api.v1.cities import resolve_city_id
 from app.models.enums import AuditAction
 from app.models.moderation import Block
 from app.models.profile import Profile, TravelHistory
@@ -148,6 +149,10 @@ async def add_history(
 ):
     await content_filter.enforce_many(field="profile", summary=payload.summary)
     entry = TravelHistory(profile_id=profile.id, **payload.model_dump())
+    # An unresolvable `city_id` is rejected rather than stored. This matters more
+    # here than on a trip post: the city feeds the matching engine, so a bad id
+    # would quietly lower the user's match score with no visible symptom.
+    entry.city_id = await resolve_city_id(db, payload.city_id)
     db.add(entry)
     await db.commit()
     await db.refresh(entry)
@@ -155,7 +160,10 @@ async def add_history(
 
 
 @router.delete("/me/histories/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_history(entry_id: uuid.UUID, profile: CurrentProfile, db: DbSession):
+@limit(WRITE_RATE)
+async def delete_history(
+    entry_id: uuid.UUID, request: Request, profile: CurrentProfile, db: DbSession
+):
     entry = await db.get(TravelHistory, entry_id)
     if entry is None or entry.profile_id != profile.id:
         raise HTTPException(status_code=404, detail="Entry not found")
@@ -221,6 +229,7 @@ async def block_profile(
 
 
 @router.delete("/{profile_id}/block", status_code=status.HTTP_204_NO_CONTENT)
+@limit(WRITE_RATE)
 async def unblock_profile(
     profile_id: uuid.UUID, request: Request, profile: CurrentProfile, db: DbSession
 ):

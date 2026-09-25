@@ -23,7 +23,25 @@ from app.core.config import settings
 from app.services import content_filter
 from app.services.content_filter import Verdict, check_local
 
-REJECTION_MARKER = "社群規範"
+#: The code the server returns for a refused write.
+#:
+#: It replaced a rendered Chinese sentence (B6). The assertions below check the
+#: *code*, because the code is what the server is responsible for: the sentence
+#: belongs to the client's dictionary, and a test asserting Chinese prose here
+#: would be re-encoding the very defect that was removed.
+REJECTION_CODE = "content_rejected"
+
+
+def _detail_code(detail) -> str:
+    """The code out of an HTTPException detail, whatever shape it arrived in.
+
+    `detail` is a `{"code": ..., "params": ...}` mapping now, but a caller that
+    still produces a plain string should surface as a readable failure rather
+    than an `AttributeError` inside an assertion.
+    """
+    if isinstance(detail, dict):
+        return str(detail.get("code", ""))
+    return f"<not a code: {detail!r}>"
 
 
 def _token(headers: dict) -> str:
@@ -211,12 +229,16 @@ def test_enforce_raises_422_with_a_message_that_names_the_field():
     with pytest.raises(HTTPException) as caught:
         asyncio.run(
             content_filter.enforce(
-                "send the deposit via Western Union", field="trip", label="行程說明"
+                "send the deposit via Western Union",
+                field="trip",
+                label="content_field.description",
             )
         )
     assert caught.value.status_code == 422
-    assert REJECTION_MARKER in caught.value.detail
-    assert "行程說明" in caught.value.detail
+    assert _detail_code(caught.value.detail) == REJECTION_CODE
+    # The *field* is named so the user knows which box to edit. It is named as a
+    # code, not as prose — the server does not pick the language.
+    assert caught.value.detail["params"]["field"] == "content_field.description"
 
 
 def test_the_rejection_never_names_the_matched_rule_or_term():
@@ -225,26 +247,32 @@ def test_the_rejection_never_names_the_matched_rule_or_term():
 
     with pytest.raises(HTTPException) as caught:
         asyncio.run(content_filter.enforce("pay with MoneyGram please", field="chat"))
+    # Serialised, so the check also covers a code that accidentally embedded the
+    # offending text.
     detail = str(caught.value.detail)
     for leaked in ("MoneyGram", "moneygram", "off_platform_payment", "western union"):
         assert leaked not in detail, detail
 
 
-def test_screen_returns_the_detail_instead_of_raising():
-    """The WebSocket path needs the verdict and the message separately."""
-    verdict, detail = asyncio.run(
-        content_filter.screen("use Western Union", field="chat", label="訊息")
+def test_screen_returns_the_rejection_instead_of_raising():
+    """The WebSocket path needs the verdict and the reason separately."""
+    verdict, rejection = asyncio.run(
+        content_filter.screen(
+            "use Western Union", field="chat", label="content_field.message"
+        )
     )
     assert verdict.action == "BLOCK"
-    assert detail is not None and REJECTION_MARKER in detail
+    assert rejection is not None
+    assert rejection.code == REJECTION_CODE
+    assert rejection.params == {"field": "content_field.message"}
 
 
-def test_screen_returns_no_detail_for_allowed_content():
-    verdict, detail = asyncio.run(
+def test_screen_returns_no_rejection_for_allowed_content():
+    verdict, rejection = asyncio.run(
         content_filter.screen("see you at the station", field="chat")
     )
     assert verdict.action == "ALLOW"
-    assert detail is None
+    assert rejection is None
 
 
 def test_enforce_many_names_the_offending_field():
@@ -258,7 +286,7 @@ def test_enforce_many_names_the_offending_field():
                 description="send the deposit via Western Union",
             )
         )
-    assert "行程說明" in caught.value.detail
+    assert caught.value.detail["params"]["field"] == "content_field.description"
 
 
 def test_enforce_many_skips_empty_fields():
@@ -432,8 +460,9 @@ def test_trip_create_rejects_blocked_title(client, register_user):
         },
     )
     assert resp.status_code == 422
-    assert REJECTION_MARKER in resp.json()["detail"]
-    assert "標題" in resp.json()["detail"]
+    assert _detail_code(resp.json()["detail"]) == REJECTION_CODE
+    # The field is named so the user knows which box to edit — as a code.
+    assert resp.json()["detail"]["params"]["field"] == "content_field.title"
 
 
 def test_trip_create_rejects_blocked_description(client, register_user):
@@ -450,7 +479,7 @@ def test_trip_create_rejects_blocked_description(client, register_user):
         },
     )
     assert resp.status_code == 422
-    assert "行程說明" in resp.json()["detail"]
+    assert resp.json()["detail"]["params"]["field"] == "content_field.description"
 
 
 def test_trip_create_accepts_ordinary_text(client, register_user):
@@ -473,7 +502,7 @@ def test_trip_update_is_moderated(client, register_user):
         json={"description": "now pay with MoneyGram please, very safe"},
     )
     assert resp.status_code == 422
-    assert REJECTION_MARKER in resp.json()["detail"]
+    assert _detail_code(resp.json()["detail"]) == REJECTION_CODE
 
 
 def test_trip_update_ignores_stored_values_it_is_not_changing(client, register_user):
@@ -497,7 +526,7 @@ def test_profile_update_rejects_blocked_bio(client, register_user):
         json={"bio": "escort service available, dm me for rates"},
     )
     assert resp.status_code == 422
-    assert "個人簡介" in resp.json()["detail"]
+    assert resp.json()["detail"]["params"]["field"] == "content_field.bio"
 
 
 def test_profile_update_accepts_ordinary_bio(client, register_user):
@@ -522,7 +551,7 @@ def test_travel_history_summary_is_moderated(client, register_user):
         },
     )
     assert resp.status_code == 422
-    assert REJECTION_MARKER in resp.json()["detail"]
+    assert _detail_code(resp.json()["detail"]) == REJECTION_CODE
 
 
 def test_review_comment_is_moderated(client, register_user):
@@ -548,7 +577,7 @@ def test_review_comment_is_moderated(client, register_user):
         },
     )
     assert resp.status_code == 422
-    assert "評價內容" in resp.json()["detail"]
+    assert resp.json()["detail"]["params"]["field"] == "content_field.comment"
 
 
 def test_chat_rest_rejects_blocked_content(client, register_user):
@@ -562,7 +591,7 @@ def test_chat_rest_rejects_blocked_content(client, register_user):
         json={"content": "send the deposit via Western Union"},
     )
     assert resp.status_code == 422
-    assert REJECTION_MARKER in resp.json()["detail"]
+    assert _detail_code(resp.json()["detail"]) == REJECTION_CODE
 
     # ...and nothing was stored.
     history = client.get(
@@ -596,7 +625,11 @@ def test_websocket_rejects_blocked_content_without_storing_it(client, register_u
         ws.send_json({"type": "message", "content": "use MoneyGram, safer"})
         frame = _recv_until(ws, "error")
         assert frame["code"] == "content_rejected"
-        assert REJECTION_MARKER in frame["detail"]
+        # A code plus the offending field, never a sentence: the socket has no
+        # locale, and the browser is the only place that knows which one to use.
+        assert _detail_code(frame["detail"]) == REJECTION_CODE
+        assert frame["detail"]["params"]["field"] == "content_field.message"
+        assert "MoneyGram" not in str(frame), "the matched term leaked back to the client"
 
         # A clean message still goes through on the same connection. Waiting for
         # the echo is what makes the storage assertion below deterministic —

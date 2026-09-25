@@ -13,7 +13,13 @@ class NotificationOut(BaseModel):
 
     id: uuid.UUID
     type: NotificationType
-    title: str
+    #: Language-neutral key the client resolves through its dictionary. The
+    #: server deliberately does **not** send a sentence: the row outlives the
+    #: locale it was written in. See `docs/AUDIT-2026-09-26.md` (B6).
+    code: str
+    #: Values to interpolate into the client-side template.
+    params: dict | None = None
+    #: Preview of the triggering content — already user text, shown verbatim.
     body: str | None = None
     read_at: datetime | None = None
     created_at: datetime

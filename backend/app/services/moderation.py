@@ -6,6 +6,7 @@ B blocks A, neither party may message, apply to, or comment on the other.
 import uuid
 
 from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.moderation import Block
@@ -66,6 +67,15 @@ async def block_profile(
     `flush()` rather than nothing because the returned `Block` is serialised
     immediately: it needs its generated `id` and `created_at`, which the
     Python-side defaults only populate on flush.
+
+    **Concurrency.** The read-then-insert is not atomic, so two simultaneous
+    blocks of the same pair both pass the `SELECT` and one loses the `INSERT` to
+    `uq_block_pair`. That loser is handled rather than propagated: it re-reads
+    the winner's row and reports it with `created=False`, which is the same
+    answer the request would have received a moment later. The alternative —
+    letting the `IntegrityError` escape — made the second of two identical
+    requests return 500 while the first returned 201, for a purely idempotent
+    operation.
     """
     blocker, blocked = _as_uuid(blocker_profile_id), _as_uuid(blocked_profile_id)
     if blocker == blocked:
@@ -77,13 +87,42 @@ async def block_profile(
                 Block.blocker_profile_id == blocker, Block.blocked_profile_id == blocked
             )
         )
-    ).scalar_one_or_none()
+    ).scalars().first()
     if existing:
         return existing, False
 
     block = Block(blocker_profile_id=blocker, blocked_profile_id=blocked)
     db.add(block)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # `uq_block_pair` fired: a concurrent request (a double-clicked block
+        # button, or two tabs) inserted the same pair between our SELECT and our
+        # INSERT. That is not an error — the caller's intent is already
+        # satisfied, and the answer is the idempotent one it would have received
+        # had the other request landed a moment earlier.
+        #
+        # Without this the `IntegrityError` propagated as a 500, so the *second*
+        # of two identical requests failed while the first succeeded. The
+        # rollback is mandatory: the session is unusable until the failed
+        # transaction is discarded, and the re-read below has to run on a clean
+        # one.
+        await db.rollback()
+        existing = (
+            await db.execute(
+                select(Block).where(
+                    Block.blocker_profile_id == blocker,
+                    Block.blocked_profile_id == blocked,
+                )
+            )
+        ).scalars().first()
+        if existing is not None:
+            return existing, False
+        # The row is genuinely gone — somebody unblocked between the failed
+        # insert and this read. Reporting a block that does not exist would be a
+        # lie, so surface the original failure rather than inventing success.
+        raise
+
     return block, True
 
 
@@ -96,7 +135,7 @@ async def unblock_profile(db: AsyncSession, blocker_profile_id, blocked_profile_
                 Block.blocker_profile_id == blocker, Block.blocked_profile_id == blocked
             )
         )
-    ).scalar_one_or_none()
+    ).scalars().first()
     if not block:
         return False
     await db.delete(block)

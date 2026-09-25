@@ -24,6 +24,11 @@ class TripPostBase(BaseModel):
     description: str = Field(min_length=10, max_length=3000)
     destination_country: str = Field(min_length=1, max_length=80)
     destination_city: str | None = Field(default=None, max_length=80)
+    #: Reference-table id for `destination_city`. `destination_city` is the
+    #: display echo; this is the value the client cannot invent. Validated
+    #: against `cities` in the router, because storing an id that does not
+    #: resolve produces a trip whose location silently never matches.
+    city_id: int | None = Field(default=None, ge=1)
     start_date: date | None = None
     end_date: date | None = None
     budget_type: BudgetType = BudgetType.MODERATE
@@ -58,6 +63,7 @@ class TripPostUpdate(BaseModel):
     description: str | None = Field(default=None, min_length=10, max_length=3000)
     destination_country: str | None = Field(default=None, max_length=80)
     destination_city: str | None = Field(default=None, max_length=80)
+    city_id: int | None = Field(default=None, ge=1)
     start_date: date | None = None
     end_date: date | None = None
     budget_type: BudgetType | None = None
@@ -70,6 +76,31 @@ class TripPostUpdate(BaseModel):
     @classmethod
     def _canonical_tags(cls, value: list[str] | None) -> list[str] | None:
         return None if value is None else normalise_tags(value)
+
+    @model_validator(mode="after")
+    def _reject_explicit_nulls(self):
+        """`null` is not the same request as "leave this field alone".
+
+        Every field is optional so the patch can be partial, which makes
+        `None` double as "absent". For a column that is NOT NULL in the
+        database, an explicit `null` therefore reaches
+        `setattr(post, field, None)` in `PATCH /trips/{id}` and turns into an
+        `IntegrityError` — a 500 for a malformed request, when the right answer
+        is 422. `exclude_unset=True` in the router handles the absent case, so
+        anyone sending an explicit null meant to clear the field, and these
+        fields have nothing to clear to.
+        """
+        nullable = {"destination_city", "start_date", "end_date", "city_id"}
+        offenders = [
+            name
+            for name in self.model_fields_set - nullable
+            if getattr(self, name) is None
+        ]
+        if offenders:
+            raise ValueError(
+                "these fields cannot be null: " + ", ".join(sorted(offenders))
+            )
+        return self
 
 
 class TripPostOut(TripPostBase):

@@ -4,10 +4,11 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.deps import CurrentProfile, DbSession
 from app.core.rate_limit import WRITE_RATE, limit
-from app.models.chat import ChatMessage, ChatRoom, ChatRoomMember
+from app.models.chat import ChatMessage, ChatRoom, ChatRoomMember, direct_pair_key
 from app.models.enums import ApplicationStatus
 from app.models.profile import Profile
 from app.models.trip import TripApplication, TripPost
@@ -47,6 +48,55 @@ async def require_membership(db, room_id: uuid.UUID, profile_id: uuid.UUID) -> C
     return room
 
 
+async def ensure_direct_room(
+    db, profile_a: uuid.UUID, profile_b: uuid.UUID, *, title: str | None = None
+) -> ChatRoom:
+    """The one place a DIRECT room is created. Does **not** commit.
+
+    Both the explicit endpoint and `_ensure_direct_room` in the trips router
+    (called when an application is accepted) create these rooms, and they must
+    agree on what "the existing room for this pair" means or the pair ends up
+    with two rooms. The pair is identified by `direct_pair_key` — a stored,
+    UNIQUE-indexed, order-independent value — rather than by comparing member
+    sets in Python, which is a read-then-write check that two concurrent
+    requests can both pass.
+
+    `IntegrityError` on the insert therefore means *somebody else created it*,
+    not that something went wrong: the loser re-reads and returns the winner's
+    room, which is the same answer it would have received a moment later.
+    """
+    key = direct_pair_key(profile_a, profile_b)
+
+    existing = (
+        await db.execute(select(ChatRoom).where(ChatRoom.direct_pair_key == key))
+    ).scalars().first()
+    if existing is not None:
+        return existing
+
+    room = ChatRoom(room_type="DIRECT", title=title, direct_pair_key=key)
+    db.add(room)
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        existing = (
+            await db.execute(select(ChatRoom).where(ChatRoom.direct_pair_key == key))
+        ).scalars().first()
+        if existing is not None:
+            return existing
+        raise
+
+    now = datetime.now(timezone.utc)
+    db.add_all(
+        [
+            ChatRoomMember(room_id=room.id, profile_id=profile_a, joined_at=now),
+            ChatRoomMember(room_id=room.id, profile_id=profile_b, joined_at=now),
+        ]
+    )
+    await db.flush()
+    return room
+
+
 @router.post("/rooms", response_model=RoomOut, status_code=status.HTTP_201_CREATED)
 @limit(WRITE_RATE)
 async def create_room(
@@ -68,30 +118,12 @@ async def create_room(
                 status_code=403, detail="You cannot interact with this user"
             ) from None
 
-        candidates = (
-            await db.execute(
-                select(ChatRoom)
-                .join(ChatRoomMember, ChatRoomMember.room_id == ChatRoom.id)
-                .where(ChatRoom.room_type == "DIRECT", ChatRoomMember.profile_id == profile.id)
-            )
-        ).scalars().unique().all()
-        for room in candidates:
-            if {m.profile_id for m in room.members} == {profile.id, payload.other_profile_id}:
-                return _room_out(room)
-
-        room = ChatRoom(room_type="DIRECT", title=payload.title)
-        db.add(room)
-        await db.flush()
-        now = datetime.now(timezone.utc)
-        db.add_all(
-            [
-                ChatRoomMember(room_id=room.id, profile_id=profile.id, joined_at=now),
-                ChatRoomMember(
-                    room_id=room.id, profile_id=payload.other_profile_id, joined_at=now
-                ),
-            ]
+        room = await ensure_direct_room(
+            db, profile.id, payload.other_profile_id, title=payload.title
         )
         await db.commit()
+        # Re-read after the commit so the response reflects the committed row
+        # whichever branch created it — including the one that lost the race.
         await db.refresh(room)
         return _room_out(room)
 
@@ -215,7 +247,9 @@ async def send_message(
                     status_code=403, detail="You cannot interact with this user"
                 ) from None
 
-    await content_filter.enforce(payload.content, field="chat", label="訊息")
+    await content_filter.enforce(
+        payload.content, field="chat", label="content_field.message"
+    )
     message = ChatMessage(room_id=room_id, sender_id=profile.id, content=payload.content)
     db.add(message)
     await db.commit()

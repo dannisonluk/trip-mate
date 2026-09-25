@@ -14,12 +14,20 @@ Design notes
 
 * **`recipient_profile_id` is `CASCADE`.** Deleting the recipient removes their
   own notifications, which is what the right-to-erasure requires.
+
+* **The human-readable sentence is composed on the client, not stored here.**
+  A row carries a stable `code` plus the `params` to interpolate; the frontend
+  looks the code up in its dictionary. Storing a rendered `title` would freeze
+  one language into the database — an English-locale user would then read
+  Traditional Chinese out of a row written months earlier by a zh-HK user, and
+  no amount of frontend work could recover it. See `docs/AUDIT-2026-09-26.md`
+  (B6).
 """
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, Index, String
+from sqlalchemy import DateTime, ForeignKey, Index, JSON, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -54,11 +62,21 @@ class Notification(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         enum_col(NotificationType, "notification_type"), nullable=False
     )
 
-    # Rendered server-side so the client never has to assemble user-facing text
-    # (and so a deleted actor still produces a sensible sentence).
-    title: Mapped[str] = mapped_column(String(120), nullable=False)
-    body: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    #: Stable, language-neutral key the client resolves through its dictionary
+    #: (e.g. `"application_accepted"`). Never rendered directly.
+    code: Mapped[str] = mapped_column(String(60), nullable=False)
 
+    #: Values to interpolate into the client-side template — nicknames, trip
+    #: titles, a rating. **Ids and scalars only**: this is a rendering payload,
+    #: and free text here would be a second copy of user content that the
+    #: erasure path would have to remember to scrub.
+    params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    #: Preview of the triggering content (a message, an application note).
+    #: Genuinely user content and therefore scrubbed by the erasure path; it is
+    #: shown as-is rather than translated, because it already is what the other
+    #: person typed.
+    body: Mapped[str | None] = mapped_column(String(300), nullable=True)
     # Who caused it. SET NULL → survives the actor being erased.
     actor_profile_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True, index=True

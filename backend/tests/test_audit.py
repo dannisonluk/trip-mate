@@ -213,6 +213,110 @@ def test_reblocking_records_only_a_real_state_change(client, raw_db, register_us
     assert len(_rows(raw_db, action="USER_BLOCKED")) == 2
 
 
+def test_block_tolerates_losing_the_insert_race(client, raw_db, register_user, monkeypatch):
+    """The lost race must be idempotent, not a 500 (B5).
+
+    `block_profile` reads before it inserts, so two concurrent blocks of the
+    same pair both pass the `SELECT` and one loses the `INSERT` to
+    `uq_block_pair`. The loser's `IntegrityError` used to propagate, which made
+    the *second* of two identical requests return 500 while the first returned
+    201 — for an operation that is explicitly documented as idempotent.
+
+    A real HTTP race cannot be scheduled deterministically, so the *interleaving*
+    is simulated instead: the early `SELECT` is forced to see nothing (as it
+    would if the other request had not committed yet), while the row is already
+    in the table by the time the insert runs. That is exactly the state the
+    loser observes, and it drives the same handler.
+
+    Forcing the stale read matters: without it the early `SELECT` finds the
+    existing row and returns before any insert happens, so the test passes even
+    with the handler removed and pins nothing.
+    """
+    alice = register_user(nickname="Alice")
+    bob = register_user(nickname="Bob")
+    path = f"/api/v1/profiles/{bob['profile']['id']}/block"
+
+    # The winner lands first: the row now exists.
+    assert client.post(path, headers=alice["headers"]).status_code == 201
+
+    from sqlalchemy import select as sa_select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.core.config import settings
+    from app.models.moderation import Block
+    from app.services import moderation
+
+    async def scenario() -> tuple[bool, str]:
+        engine = create_async_engine(settings.DATABASE_URL)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as db:
+                # Blind the courtesy check exactly once, so the code path
+                # proceeds to the INSERT and hits the constraint.
+                state = {"blinded": False}
+                original = db.execute
+
+                async def execute(stmt, *args, **kwargs):
+                    if not state["blinded"] and "FROM blocks" in str(stmt):
+                        state["blinded"] = True
+                        return await original(
+                            sa_select(Block).where(Block.id == None)  # noqa: E711
+                        )
+                    return await original(stmt, *args, **kwargs)
+
+                db.execute = execute  # type: ignore[method-assign]
+                try:
+                    block, created = await moderation.block_profile(
+                        db, alice["profile"]["id"], bob["profile"]["id"]
+                    )
+                    return created, str(block.id)
+                finally:
+                    db.execute = original  # type: ignore[method-assign]
+        finally:
+            await engine.dispose()
+
+    created, block_id = asyncio.run(scenario())
+    assert created is False, "a repeat block must not claim to have created a row"
+    assert block_id
+
+    # Exactly one block row, exactly one audit entry — the repeat added nothing.
+    pair = (
+        alice["profile"]["id"].replace("-", ""),
+        bob["profile"]["id"].replace("-", ""),
+    )
+    assert (
+        raw_db.execute(
+            "SELECT COUNT(*) FROM blocks WHERE blocker_profile_id = ? AND blocked_profile_id = ?",
+            pair,
+        ).fetchone()[0]
+        == 1
+    )
+    assert len(_rows(raw_db, action="USER_BLOCKED")) == 1
+
+
+def test_the_block_route_still_answers_201_on_a_repeat(client, register_user):
+    """The HTTP contract is unchanged by the fix: idempotent means 201 either way.
+
+    201 rather than 200 on a repeat is deliberate — the block is in force after
+    the call regardless of who created it, and the caller asked for a state, not
+    for an insert. The returned row is the same one every time, not a fresh one.
+    """
+    alice = register_user(nickname="Alice")
+    bob = register_user(nickname="Bob")
+    path = f"/api/v1/profiles/{bob['profile']['id']}/block"
+
+    first = client.post(path, headers=alice["headers"])
+    assert first.status_code == 201, first.text
+
+    for _ in range(2):
+        again = client.post(path, headers=alice["headers"])
+        assert again.status_code == 201, again.text
+        assert again.json()["id"] == first.json()["id"], (
+            "a repeat block returned a different row"
+        )
+
+
+
 # --- reporting (§3.2) ------------------------------------------------------
 
 

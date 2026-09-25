@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.deps import CurrentUser, DbSession
-from app.core.rate_limit import LOGIN_RATE, OTP_RATE, REGISTER_RATE, limit
+from app.core.rate_limit import LOGIN_RATE, OTP_RATE, REFRESH_RATE, REGISTER_RATE, WRITE_RATE, limit
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -140,7 +140,9 @@ async def login(payload: LoginRequest, request: Request, response: Response, db:
 
 
 @router.post("/refresh", response_model=TokenResponse)
+@limit(REFRESH_RATE)
 async def refresh(
+    request: Request,
     response: Response,
     db: DbSession,
     refresh_token: str | None = Cookie(default=None, alias=REFRESH_COOKIE),
@@ -187,7 +189,9 @@ async def refresh(
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+@limit(WRITE_RATE)
 async def logout(
+    request: Request,
     response: Response,
     refresh_token: str | None = Cookie(default=None, alias=REFRESH_COOKIE),
 ):
@@ -209,7 +213,13 @@ async def logout(
 
 
 @router.post("/password", status_code=status.HTTP_204_NO_CONTENT)
-async def change_password(payload: PasswordChangeRequest, user: CurrentUser, db: DbSession):
+@limit(WRITE_RATE)
+async def change_password(
+    payload: PasswordChangeRequest,
+    request: Request,
+    user: CurrentUser,
+    db: DbSession,
+):
     if not await verify_password_async(payload.current_password, user.password_hash):
         raise HTTPException(status_code=401, detail=_GENERIC_AUTH_ERROR)
     user.password_hash = await hash_password_async(payload.new_password)

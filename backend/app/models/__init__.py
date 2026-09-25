@@ -1,6 +1,7 @@
 """Trip Mate ORM models — import all so `Base.metadata` is fully populated."""
 from app.models.audit import AuditLog
 from app.models.chat import ChatMessage, ChatRoom, ChatRoomMember
+from app.models.city import City
 from app.models.enums import (
     ApplicationStatus,
     AuditAction,
@@ -22,6 +23,7 @@ __all__ = [
     "User",
     "Profile",
     "TravelHistory",
+    "City",
     "TripPost",
     "TripApplication",
     "TripPostTag",

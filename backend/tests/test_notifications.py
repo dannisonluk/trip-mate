@@ -7,8 +7,13 @@ The security-relevant properties here are:
 * Notifications are never readable by anyone but the recipient — enforced in the
   WHERE clause so a foreign id yields 404, not 403 (no existence leak).
 * No self-notifications.
+* **The server never chooses a language** (B6): a row carries a code and params,
+  and the client composes the sentence. A server-rendered title would freeze
+  whichever locale the writer happened to be using.
 """
 from __future__ import annotations
+
+import re
 
 from tests.test_api_flow import _make_trip, _recv_until, _token
 
@@ -61,7 +66,11 @@ def test_application_notifies_trip_owner(client, register_user):
     assert page["unread"] == 1
     item = page["items"][0]
     assert item["type"] == "APPLICATION_RECEIVED"
-    assert "Applicant" in item["title"]
+    # A language-neutral code plus params, not a rendered sentence: the server
+    # must not decide what language this row reads in.
+    assert item["code"] == "trip.application_received"
+    assert item["params"]["actor"] == "Applicant"
+    assert item["params"]["trip"] == trip["title"]
     assert item["actor"]["nickname"] == "Applicant"
     assert item["trip_post_id"] == trip["id"]
 
@@ -80,7 +89,8 @@ def test_acceptance_notifies_applicant(client, register_user):
     page = _notifications(client, applicant)
     assert page["unread"] == 1
     assert page["items"][0]["type"] == "APPLICATION_ACCEPTED"
-    assert "Owner" in page["items"][0]["title"]
+    assert page["items"][0]["code"] == "trip.application_accepted"
+    assert page["items"][0]["params"]["actor"] == "Owner"
 
 
 def test_rejection_notifies_applicant(client, register_user):
@@ -315,3 +325,121 @@ def test_unread_only_filter_and_pagination(client, register_user):
     assert first["total"] == 5 and second["total"] == 5
     assert len(first["items"]) == 2
     assert {i["id"] for i in first["items"]}.isdisjoint({i["id"] for i in second["items"]})
+
+
+# --------------------------------------------------------------------------
+# Localisation (B6) — the server must not choose a language
+# --------------------------------------------------------------------------
+
+_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def test_no_notification_field_carries_hardcoded_chinese(client, register_user):
+    """Every server-authored field is language-neutral; only `body` holds prose.
+
+    This is the regression guard for B6. The old code assembled a Chinese
+    sentence into `title`, which meant an English-locale user read Traditional
+    Chinese out of a card the server had rendered for a zh-HK user months
+    earlier. The fix only holds if the *sentence* never comes back, so this
+    asserts on the shape of the payload rather than on one endpoint.
+
+    `body` is exempt by design: it is a preview of what another person typed, so
+    it is Chinese because the sender wrote Chinese, and translating it would be
+    falsifying their message.
+    """
+    owner = register_user(nickname="Owner")
+    applicant = register_user(nickname="Applicant")
+    trip = _make_trip(client, owner)
+    application = _apply(client, applicant, trip["id"])
+    _decide(client, owner, application["id"], "ACCEPTED")
+
+    # Cover all three notification-producing paths so a single missed call site
+    # cannot hide behind the others.
+    client.post(
+        "/api/v1/reviews",
+        headers=applicant["headers"],
+        json={"reviewee_id": owner["profile"]["id"], "rating": 5, "comment": "Great"},
+    )
+    rooms = client.get("/api/v1/chat/rooms", headers=applicant["headers"]).json()
+    with client.websocket_connect(
+        f"/api/v1/ws/chat/{rooms[0]['id']}?token={_token(applicant['headers'])}"
+    ) as ws:
+        _recv_until(ws, "presence")
+        ws.send_json({"type": "message", "content": "Hello"})
+        _recv_until(ws, "message")
+
+    for viewer in (owner, applicant):
+        for item in _notifications(client, viewer)["items"]:
+            assert item["code"], f"no code on a {item['type']} notification"
+            assert not _HAN.search(item["code"]), item["code"]
+            for key, value in (item.get("params") or {}).items():
+                # Params are ids, names and scalars — never a phrase. A name may
+                # be Chinese (that is the user's own nickname); punctuation and
+                # grammar must not be.
+                assert "：" not in str(value), (key, value)
+                assert "」" not in str(value), (key, value)
+            assert "title" not in item, (
+                "a rendered title came back — the client must compose the sentence"
+            )
+
+
+def test_room_scoped_message_notification_uses_the_room_code(client, register_user):
+    """A TRIP room names itself, so its notification gets the room-aware code.
+
+    Two codes rather than one with an optional label: the presence of the room
+    name changes the sentence's shape, not just a substituted word.
+    """
+    owner = register_user(nickname="Owner")
+    applicant = register_user(nickname="Applicant")
+    trip = _make_trip(client, owner)
+    application = _apply(client, applicant, trip["id"])
+    _decide(client, owner, application["id"], "ACCEPTED")
+
+    # The organiser opens the group room, which is what gives it a title.
+    group = client.post(
+        "/api/v1/chat/rooms",
+        headers=owner["headers"],
+        json={"room_type": "TRIP", "trip_post_id": trip["id"]},
+    )
+    assert group.status_code in (200, 201), group.text
+    room_id = group.json()["id"]
+
+    client.post("/api/v1/notifications/read-all", headers=applicant["headers"])
+    with client.websocket_connect(
+        f"/api/v1/ws/chat/{room_id}?token={_token(owner['headers'])}"
+    ) as ws:
+        _recv_until(ws, "presence")
+        ws.send_json({"type": "message", "content": "Leaving at nine"})
+        _recv_until(ws, "message")
+
+    item = _notifications(client, applicant)["items"][0]
+    assert item["code"] == "chat.new_message_in_room"
+    assert item["params"]["room"] == trip["title"]
+    assert item["params"]["actor"] == "Owner"
+
+
+def test_direct_room_message_notification_uses_the_plain_code(client, register_user):
+    """A DIRECT room has no label, so the sentence must not invent one.
+
+    Naming it after the sender would read "Alice in Alice".
+    """
+    owner = register_user(nickname="Owner")
+    applicant = register_user(nickname="Applicant")
+    trip = _make_trip(client, owner)
+    application = _apply(client, applicant, trip["id"])
+    _decide(client, owner, application["id"], "ACCEPTED")
+    client.post("/api/v1/notifications/read-all", headers=owner["headers"])
+
+    rooms = client.get("/api/v1/chat/rooms", headers=applicant["headers"]).json()
+    direct = next(r for r in rooms if r["room_type"] == "DIRECT")
+
+    with client.websocket_connect(
+        f"/api/v1/ws/chat/{direct['id']}?token={_token(applicant['headers'])}"
+    ) as ws:
+        _recv_until(ws, "presence")
+        ws.send_json({"type": "message", "content": "hi"})
+        _recv_until(ws, "message")
+
+    item = _notifications(client, owner)["items"][0]
+    assert item["code"] == "chat.new_message"
+    assert "room" not in (item["params"] or {}), item["params"]

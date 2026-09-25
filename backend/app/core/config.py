@@ -2,6 +2,7 @@
 from functools import lru_cache
 from typing import List, Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -141,6 +142,38 @@ class Settings(BaseSettings):
             self.DATABASE_URL.replace("+asyncpg", "+psycopg")
             .replace("+aiosqlite", "")
         )
+
+    @field_validator("COOKIE_DOMAIN")
+    @classmethod
+    def _cookie_domain_must_be_empty_in_production(cls, value: str, info) -> str:
+        """Refuse a production `COOKIE_DOMAIN`.
+
+        The refresh cookie is intentionally host-only: an empty value makes
+        `set_cookie` omit the `Domain` attribute entirely, so the cookie is sent
+        back only to the host that set it and never to a sibling subdomain (a
+        hijacked subdomain is the classic escalation path — it could otherwise
+        present the refresh cookie to the API).
+
+        Nothing else in the codebase observes this setting, which is exactly why
+        it needs a guard: a production deployment that sets `COOKIE_DOMAIN` would
+        run perfectly well while silently losing that guarantee. Failing at
+        settings-construction means the process refuses to start, rather than
+        discovering the weakness during an incident.
+
+        Deliberately NOT solved by renaming the cookie with the `__Host-` prefix:
+        that prefix requires `Path=/` and *no* `Domain`, while the refresh cookie's
+        path is deliberately narrowed to `/api/v1/auth` to shrink its exposure to
+        CSRF. The prefix is therefore spec-incompatible with the current design,
+        and switching to it would trade a genuine CSRF narrowing for a
+        configuration guard that this validator provides anyway.
+        """
+        if value and info.data.get("ENV") == "production":
+            raise ValueError(
+                "COOKIE_DOMAIN must be empty in production: the refresh cookie is "
+                "deliberately host-only. Setting a Domain would send it to every "
+                "sibling subdomain. Remove COOKIE_DOMAIN from the environment."
+            )
+        return value
 
 
 @lru_cache

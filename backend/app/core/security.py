@@ -8,7 +8,11 @@ Implements Security & Privacy Spec §1:
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
@@ -18,6 +22,9 @@ from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHas
 from jose import JWTError, jwt
 
 from app.core.config import settings
+from app.services import kv
+
+logger = logging.getLogger("tripmate.security")
 
 # --- Password hashing (Argon2id) -------------------------------------------
 # time_cost=3, memory_cost=64 MiB, parallelism=4 → OWASP-recommended profile.
@@ -92,17 +99,92 @@ def verify_password_dummy(password: str) -> None:
 #
 # The sync primitives above stay public because CLI scripts (app/seed.py) have
 # no event loop to protect.
+#
+# --- Two caps, and why both are needed --------------------------------------
+# `PASSWORD_HASH_MAX_CONCURRENCY` is a *memory budget*: each in-flight hash
+# reserves memory_cost (64 MiB), so the number of simultaneous hashes is a bound
+# on the deployment's peak RSS, not a throughput tuning knob.
+#
+#   1. `anyio.to_thread` limiter (set in `main.py` lifespan) — **per process**.
+#      This is what actually protects the machine: it is the last line of defence
+#      and it works even when Redis is gone.
+#   2. `kv.DistributedSemaphore` — **global across replicas**. Without it the
+#      budget multiplies by the replica count (#8): 8 x 4 replicas = 32 hashes =
+#      ~2 GB, which is how a container gets OOM-killed while every individual
+#      process looks correctly configured.
+#
+# The global cap is advisory in the sense that it *waits* rather than rejects —
+# a login must not fail because the pool is busy. If the shared counter cannot be
+# reached, `_hash_slot` degrades to the per-process limiter alone.
+_HASH_SLOT_KEY = "tripmate:hashslots"
+_hash_slots: "kv.DistributedSemaphore | None" = None
+
+# Bounded wait: ~2.5 s at 50 ms granularity. Long enough to absorb a burst of
+# logins, short enough that a user does not stare at a spinner. Past that we
+# proceed uncounted rather than fail the request — availability wins, and the
+# per-process limiter still bounds what one replica can do to the machine.
+_HASH_SLOT_WAIT_SECONDS = 2.5
+_HASH_SLOT_POLL_SECONDS = 0.05
+
+
+def _semaphore() -> "kv.DistributedSemaphore":
+    global _hash_slots
+    if _hash_slots is None:
+        _hash_slots = kv.DistributedSemaphore(
+            limit=settings.PASSWORD_HASH_MAX_CONCURRENCY
+        )
+    return _hash_slots
+
+
+@asynccontextmanager
+async def _hash_slot():
+    """Hold one global hash permit for the duration of the block.
+
+    Always releases in `finally` — a stranded permit is only reclaimed when the
+    Redis key's TTL lapses, so losing one per crashed call would slowly strangle
+    the pool.
+    """
+    sem = _semaphore()
+    acquired = await sem.acquire(_HASH_SLOT_KEY)
+    deadline = time.monotonic() + _HASH_SLOT_WAIT_SECONDS
+    while not acquired and time.monotonic() < deadline:
+        await asyncio.sleep(_HASH_SLOT_POLL_SECONDS)
+        acquired = await sem.acquire(_HASH_SLOT_KEY)
+    if not acquired:
+        # Saturated (or Redis is unreachable and the local count is full). Let the
+        # request through anyway and rely on the per-process limiter: refusing
+        # here would turn "busy" into "login is broken".
+        logger.warning(
+            "Password-hash concurrency cap (%s) saturated for %ss — proceeding "
+            "uncounted. Raise PASSWORD_HASH_MAX_CONCURRENCY or add workers if "
+            "this is frequent.",
+            settings.PASSWORD_HASH_MAX_CONCURRENCY,
+            _HASH_SLOT_WAIT_SECONDS,
+        )
+        try:
+            yield
+        finally:
+            return
+    try:
+        yield
+    finally:
+        await sem.release(_HASH_SLOT_KEY)
+
+
 async def hash_password_async(password: str) -> str:
-    return await to_thread.run_sync(hash_password, password)
+    async with _hash_slot():
+        return await to_thread.run_sync(hash_password, password)
 
 
 async def verify_password_async(password: str, hashed: str) -> bool:
-    return await to_thread.run_sync(verify_password, password, hashed)
+    async with _hash_slot():
+        return await to_thread.run_sync(verify_password, password, hashed)
 
 
 async def verify_password_dummy_async(password: str) -> None:
     """Async twin of `verify_password_dummy` — see its docstring for the why."""
-    await to_thread.run_sync(verify_password_dummy, password)
+    async with _hash_slot():
+        await to_thread.run_sync(verify_password_dummy, password)
 
 
 # --- JWT -------------------------------------------------------------------

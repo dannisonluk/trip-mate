@@ -94,6 +94,7 @@ async def list_reports(
 
 
 @admin_router.patch("/reports/{report_id}", response_model=ReportOut)
+@limit(WRITE_RATE)
 async def update_report_status(
     report_id: uuid.UUID,
     new_status: str,

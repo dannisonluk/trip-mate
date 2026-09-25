@@ -11,6 +11,7 @@ Security contract:
 from __future__ import annotations
 
 import io
+import re
 import uuid
 from pathlib import Path
 
@@ -68,8 +69,41 @@ def sanitize_image(data: bytes) -> tuple[bytes, str, str]:
     return out.getvalue(), mime, ext
 
 
+#: Object-key namespaces a caller may write into. Deliberately closed: the
+#: prefix decides *where in the bucket* an object lands, so an unvalidated one is
+#: a write primitive rather than a path segment.
+ALLOWED_PREFIXES = ("uploads", "avatars", "trips")
+#: Per-profile namespace, e.g. `profiles/<uuid>`. Matched exactly — the id must
+#: be a uuid, so `profiles/../../evil` and `profiles/other-user` both fail.
+_PROFILE_PREFIX = re.compile(
+    r"^profiles/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
+
+def _validate_prefix(prefix: str) -> str:
+    """Reject any prefix that could escape or collide with another namespace.
+
+    `build_key` interpolates the prefix straight into the object key, so a value
+    like `../../etc` or one with a leading `/` decides the destination. The local
+    backend's `_local_path` has a traversal guard, but **presign is S3-only** —
+    the guard lives in a function presign never calls, so nothing was checking
+    it on that path at all.
+
+    An allow-list rather than a sanitising pass: a filter that strips `..` and
+    `/` has to enumerate every way to write a namespace escape, whereas a fixed
+    set (plus one exactly-specified pattern) has nothing to enumerate.
+    """
+    if prefix in ALLOWED_PREFIXES or _PROFILE_PREFIX.match(prefix):
+        return prefix
+    raise UploadError(
+        "Unsupported upload prefix. Allowed: "
+        + ", ".join(ALLOWED_PREFIXES)
+        + ", profiles/<uuid>."
+    )
+
+
 def build_key(prefix: str, ext: str) -> str:
-    return f"{prefix}/{uuid.uuid4().hex}.{ext}"
+    return f"{_validate_prefix(prefix)}/{uuid.uuid4().hex}.{ext}"
 
 
 # --- Local backend ---------------------------------------------------------

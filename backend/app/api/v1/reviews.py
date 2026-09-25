@@ -8,6 +8,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.v1.profiles import resolve_profile
 from app.core.deps import CurrentProfile, DbSession
@@ -78,6 +79,14 @@ async def create_review(
             detail="You can only review a trip you both took part in",
         )
 
+    # `.first()`, never `.scalar_one_or_none()`. The read is a courtesy check
+    # that produces a clean 409; it is not the guard. Two rows matching here
+    # (which is possible because SQL treats NULLs as distinct, so
+    # `uq_review_once_per_trip` cannot cover the NULL-trip case) used to raise
+    # `MultipleResultsFound` and turn a duplicate submission into a permanent
+    # 500 that no request could ever clear. A pre-check also cannot see a
+    # concurrent insert at all, so it must not be the only thing standing
+    # between the client and a duplicate — the constraint is.
     duplicate = (
         await db.execute(
             select(Review).where(
@@ -93,7 +102,7 @@ async def create_review(
                 else Review.trip_post_id == payload.trip_post_id,
             )
         )
-    ).scalar_one_or_none()
+    ).scalars().first()
     if duplicate:
         raise HTTPException(status_code=409, detail="You have already reviewed this trip")
 
@@ -109,17 +118,35 @@ async def create_review(
     )
     db.add(review)
 
+    # Notification is emitted **before** the commit, so it shares the review's
+    # transaction: either both land or neither does. That is only sound because
+    # a failed insert rolls the whole thing back, which is exactly why the
+    # `IntegrityError` below must not silently swallow the session into a state
+    # where the notification still gets committed.
     await notifications_service.create(
         db,
         recipient_profile_id=payload.reviewee_id,
         type=NotificationType.REVIEW_RECEIVED,
-        title=f"{profile.nickname} 給了你 {payload.rating} 星評價",
+        code="review.received",
+        params={"actor": profile.nickname, "rating": payload.rating},
         body=(payload.comment or "")[:200] or None,
         actor_profile_id=profile.id,
         trip_post_id=payload.trip_post_id,
     )
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # The real guard: `uq_review_once_per_trip` for a trip-scoped review, or
+        # `uq_review_once_per_untripped_pair` (partial, `trip_post_id IS NULL`)
+        # for the other branch. Reaching here means a concurrent request won the
+        # race after our courtesy check passed — the correct answer is the same
+        # 409 it would have received, not a 500.
+        await db.rollback()
+        raise HTTPException(
+            status_code=409, detail="You have already reviewed this trip"
+        ) from None
+
     await db.refresh(review)
 
     out = ReviewOut.model_validate(review)

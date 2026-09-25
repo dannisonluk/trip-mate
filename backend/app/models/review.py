@@ -2,7 +2,7 @@
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import ForeignKey, Integer, JSON, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, Integer, JSON, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -18,6 +18,19 @@ class Review(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint(
             "reviewer_id", "reviewee_id", "trip_post_id", name="uq_review_once_per_trip"
+        ),
+        # The constraint above cannot fire when `trip_post_id IS NULL`: SQL treats
+        # NULLs as distinct, so `(a, b, NULL)` never collides with another
+        # `(a, b, NULL)` and a pair could accumulate unlimited untripped reviews.
+        # This partial index closes that hole for exactly the rows the unique
+        # constraint cannot see.
+        Index(
+            "uq_review_once_per_untripped_pair",
+            "reviewer_id",
+            "reviewee_id",
+            unique=True,
+            postgresql_where=text("trip_post_id IS NULL"),
+            sqlite_where=text("trip_post_id IS NULL"),
         ),
     )
 

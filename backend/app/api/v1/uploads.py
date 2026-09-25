@@ -11,8 +11,20 @@ router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 
 class PresignRequest(BaseModel):
+    """No `prefix` field, deliberately.
+
+    The prefix decides where in the bucket the object is written, so accepting it
+    from the client made the object namespace caller-controlled. It used to be a
+    field with the default `"uploads"`, and nothing validated it: a caller could
+    aim the pre-signed PUT at any prefix it liked, including one shaped like
+    another user's namespace, because `presign_put` goes straight to S3 and never
+    touches the local backend's path-traversal guard.
+
+    The prefix is now derived from the authenticated profile, so the only
+    namespace a caller can write to is their own.
+    """
+
     content_type: str
-    prefix: str = "uploads"
 
 
 class UploadResult(BaseModel):
@@ -43,10 +55,15 @@ async def upload_image(request: Request, profile: CurrentProfile, file: UploadFi
 
 
 @router.post("/presign", response_model=PresignResult)
-async def presign(payload: PresignRequest, profile: CurrentProfile):
-    """Optional direct-to-storage upload path (S3/R2 only)."""
+@limit(UPLOAD_RATE)
+async def presign(payload: PresignRequest, request: Request, profile: CurrentProfile):
+    """Optional direct-to-storage upload path (S3/R2 only).
+
+    The prefix is the caller's own profile namespace and is not client-supplied
+    — see `PresignRequest`.
+    """
     try:
-        key, url = presign_put(payload.content_type, prefix=payload.prefix)
+        key, url = presign_put(payload.content_type, prefix=f"profiles/{profile.id}")
     except UploadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return PresignResult(

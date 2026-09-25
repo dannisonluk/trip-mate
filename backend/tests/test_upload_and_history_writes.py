@@ -126,7 +126,7 @@ def test_presign_refuses_all_types_on_the_local_backend(client, register_user):
         resp = client.post(
             "/api/v1/uploads/presign",
             headers=user["headers"],
-            json={"content_type": content_type, "prefix": "uploads"},
+            json={"content_type": content_type},
         )
         assert resp.status_code == 400, (content_type, resp.text)
         assert "S3" in resp.json()["detail"], (content_type, resp.json())
@@ -195,6 +195,107 @@ def test_presign_requires_authentication(client):
         "/api/v1/uploads/presign", json={"content_type": "image/png"}
     )
     assert resp.status_code == 401
+
+
+# --- the prefix is server-derived, not caller-supplied (B4) ---------------
+
+
+def test_presign_request_schema_has_no_prefix_field():
+    """The field is gone, so there is nothing to validate or forget to validate.
+
+    `prefix` used to be a request field defaulting to `"uploads"`, and it went
+    straight into `build_key`. The local backend has a path-traversal guard, but
+    **presign is S3-only** — it never calls `_put_local`, so that guard was never
+    reached on this path and the object namespace was entirely caller-controlled.
+
+    Removing the field is stronger than validating it: a validated field can be
+    un-validated by a later edit, whereas a field that does not exist cannot be
+    supplied at all.
+    """
+    from app.api.v1.uploads import PresignRequest
+
+    assert "prefix" not in PresignRequest.model_fields
+
+
+def test_presign_ignores_a_client_supplied_prefix(client, register_user):
+    """Extra JSON keys are dropped, so the namespace stays server-chosen."""
+    user = register_user(nickname="PresignNamespace")
+    resp = client.post(
+        "/api/v1/uploads/presign",
+        headers=user["headers"],
+        # On the local backend this 400s for the S3 reason, which is fine: the
+        # point is that the request is not rejected for a *schema* error, i.e.
+        # the extra key was ignored rather than honoured or fatal.
+        json={"content_type": "image/png", "prefix": "someone-elses-namespace"},
+    )
+    assert resp.status_code == 400
+    assert "S3" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "bad_prefix",
+    [
+        "../../etc",
+        "..",
+        "/etc",
+        "profiles/../../evil",
+        "profiles/not-a-uuid",
+        "profiles/",
+        "profiles",
+        "",
+        "avatars/../../evil",
+        "uploads/../profiles",
+    ],
+)
+def test_build_key_rejects_an_escaping_prefix(bad_prefix):
+    """The namespace guard, pinned where it can be reached.
+
+    A `build_key` that accepted any prefix would let a caller write outside its
+    own namespace — or outside the bucket, depending on how the object store
+    resolves `..`. The check is an allow-list plus one exact pattern, so `..`,
+    absolute paths and paths shaped like another user's namespace all fail.
+    """
+    import uuid as uuid_module
+
+    from app.services.storage import UploadError, build_key
+
+    with pytest.raises(UploadError, match="Unsupported upload prefix"):
+        build_key(bad_prefix, "png")
+
+    # The permitted forms are still permitted — otherwise the guard would be
+    # "reject everything", which passes the assertions above and breaks uploads.
+    for good in ("uploads", "avatars", "trips"):
+        assert build_key(good, "png").startswith(f"{good}/")
+    assert build_key(f"profiles/{uuid_module.uuid4()}", "png").startswith("profiles/")
+
+
+def test_presign_uses_the_callers_own_profile_namespace():
+    """The derived prefix is the authenticated profile's, and nothing else.
+
+    Called at the service layer with an S3 backend forced, because the HTTP
+    surface cannot reach it locally — the same reason
+    `test_presign_content_type_allow_list_rejects_non_images` exists.
+    """
+    import uuid as uuid_module
+
+    from app.core.config import settings
+    from app.services.storage import build_key, presign_put
+
+    original = settings.STORAGE_BACKEND
+    settings.STORAGE_BACKEND = "s3"
+    try:
+        profile_id = uuid_module.uuid4()
+        key, _url = presign_put("image/png", prefix=f"profiles/{profile_id}")
+        assert key.startswith(f"profiles/{profile_id}/"), key
+
+        # A namespace shaped like a *different* user is refused.
+        from app.services.storage import UploadError
+
+        with pytest.raises(UploadError):
+            build_key(f"profiles/{uuid_module.uuid4()}/../other", "png")
+    finally:
+        settings.STORAGE_BACKEND = original
+
 
 
 # --- 3. DELETE /profiles/me/histories/{entry_id} ---------------------------
