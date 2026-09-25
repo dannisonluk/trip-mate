@@ -77,7 +77,15 @@ async def _persist_message(room_id: uuid.UUID, profile_id: uuid.UUID, content: s
         sender = await db.get(Profile, profile_id)
         room = await db.get(ChatRoom, room_id)
         if sender is not None:
-            room_label = (room.title or "行程群組") if room and room.room_type == "TRIP" else None
+            # A TRIP room is named after its trip, which is genuine user content
+            # and stays as typed. Only the *absence* of a name needs translating,
+            # and that is expressed as `room_label=None` + a different code rather
+            # than by inventing a Chinese placeholder string here.
+            room_label = (
+                room.title
+                if room is not None and room.room_type == "TRIP" and room.title
+                else None
+            )
             for recipient_id in member_ids:
                 await notifications_service.notify_new_message(
                     db,
@@ -128,7 +136,11 @@ async def chat_socket(websocket: WebSocket, room_id: str, token: str | None = No
             "type": "presence",
             "event": "join",
             "profile_id": profile_id_str,
-            "online": manager.online_profiles(room_id),
+            # Awaited: the list is the union across replicas, so it is not
+            # knowable from local state. Broadcasting the join *after* the
+            # registry write is what makes the joiner's own name appear in the
+            # frame others receive.
+            "online": await manager.online_profiles(room_id),
         },
     )
 
@@ -159,8 +171,9 @@ async def chat_socket(websocket: WebSocket, room_id: str, token: str | None = No
                 await websocket.send_json({"type": "error", "code": "unsupported_type"})
                 continue
 
-            # §3.2 — 2 messages/second per user.
-            if not manager.allow_message(profile_id_str):
+            # §3.2 — 2 messages/second per user, counted in the shared store so
+            # the quota does not multiply with the replica count.
+            if not await manager.allow_message(profile_id_str):
                 await websocket.send_json(
                     {
                         "type": "error",
@@ -180,14 +193,21 @@ async def chat_socket(websocket: WebSocket, room_id: str, token: str | None = No
 
             # Moderated before the row is built. `screen` rather than `enforce`
             # because an HTTPException is meaningless on a socket: this caller
-            # needs the verdict and the client-safe message so it can send an
-            # error frame the UI can render.
+            # needs the verdict and the structured reason so it can send an
+            # error frame the UI can render in the reader's own language.
             _verdict, rejection = await content_filter.screen(
-                content, field="chat", label="訊息"
+                content, field="chat", label="content_field.message"
             )
             if rejection is not None:
+                # `code` is the frame discriminator the client switches on;
+                # `detail` carries the structured reason, mirroring the HTTP
+                # error shape so both paths resolve through one code path.
                 await websocket.send_json(
-                    {"type": "error", "code": "content_rejected", "detail": rejection}
+                    {
+                        "type": "error",
+                        "code": rejection.code,
+                        "detail": rejection.as_detail(),
+                    }
                 )
                 continue
 
@@ -205,15 +225,16 @@ async def chat_socket(websocket: WebSocket, room_id: str, token: str | None = No
             await manager.broadcast(room_id, {"type": "message", **saved})
 
             # Safety nudge: warn the sender if they just shared a phone-like string.
+            #
+            # `code` only — the client owns the sentence. Shipping the zh-HK text
+            # here meant an English-locale user received Traditional Chinese, and
+            # `check:i18n` could not see it because it only scans frontend
+            # sources. See `docs/AUDIT-2026-09-26.md` (B6).
             if is_phone_like(content):
                 await manager.send_personal(
                     room_id,
                     profile_id_str,
-                    {
-                        "type": "safety_hint",
-                        "code": "possible_phone",
-                        "detail": "為保障私隱，請避免在建立信任前交換聯絡方式或進行金錢交易。",
-                    },
+                    {"type": "safety_hint", "code": "possible_phone"},
                 )
 
     except WebSocketDisconnect:
@@ -226,6 +247,6 @@ async def chat_socket(websocket: WebSocket, room_id: str, token: str | None = No
                 "type": "presence",
                 "event": "leave",
                 "profile_id": profile_id_str,
-                "online": manager.online_profiles(room_id),
+                "online": await manager.online_profiles(room_id),
             },
         )

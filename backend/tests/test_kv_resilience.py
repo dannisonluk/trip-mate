@@ -24,8 +24,12 @@ DEAD_REDIS = "redis://127.0.0.1:1/0"
 def _reset(monkeypatch, url: str = DEAD_REDIS) -> None:
     monkeypatch.setattr(settings, "REDIS_URL", url)
     monkeypatch.setattr(kv, "_redis_client", None)
-    monkeypatch.setattr(kv, "_redis_disabled", False)
-    monkeypatch.setattr(kv, "_cooldown_until", 0.0)
+    # The breaker state used to be two module globals (`_redis_disabled`,
+    # `_cooldown_until`); it is now a `_BreakerState` instance so the window can
+    # be shared across replicas (#22a). Same semantics, one object — and the
+    # test asserts through the public `_breaker_open()` rather than the field, so
+    # a future move of the state does not silently stop being covered.
+    kv.reset_breaker_for_tests()
     kv.reset_memory_store()
 
 
