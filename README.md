@@ -103,14 +103,15 @@ Trip Mate 解決「**想找人一起去旅行，但不知道找誰、也不敢�
                                     └──────────────────────────────┘
 ```
 
-### 2.3 資料模型（14 張表）
+### 2.3 資料模型（15 張表）
 
 | 表 | 用途 | 關鍵設計 |
 |----|------|----------|
+| `cities` | 城市參考表 | **唯讀參考資料**（只由 `scripts/import_cities.py` 寫入，應用程式永不寫）：GeoNames `cities5000` 的 69,740 列，只保留 19 欄中的 10 欄。`id` 用 GeoNames `geonameid` 而非 UUID（已是穩定唯一鍵，且是回寫原始資料集的 join key）；`asciiname` 帶 `COLLATE NOCASE` 讓前綴搜尋真的走得到 B-tree（實測 1,350 ms → 30 ms）；**唯一**的座標來源，只有市中心一點 |
 | `users` | 帳號 | `phone_number` 唯一且為登入識別碼；`is_verified`；`consent_privacy/terms/consent_at` 同意軌跡；`is_anonymized` |
 | `profiles` | 公開檔案 | `nickname`、`mbti`、`gender`；`travel_style_tags` / `languages` 用 JSON；**無電話欄位** |
-| `travel_histories` | 旅遊足跡 | `budget_type`、`photo_urls`、`is_public` 逐筆控制可見性 |
-| `trip_posts` | 行程貼文 | 只有 `destination_country/city`，**無精確地址欄位**；`budget_type`、`target_gender`、`looking_for_count`、`status` |
+| `travel_histories` | 旅遊足跡 | `budget_type`、`photo_urls`、`is_public` 逐筆控制可見性；`city` 僅為顯示字串，`city_id`（FK，`SET NULL`）才是配對用的可驗證鍵 |
+| `trip_posts` | 行程貼文 | 只有 `destination_country/city`，**無精確地址欄位**；`city_id`（FK，`SET NULL`）指向 `cities`，寫入前經 `resolve_city_id()` 驗證；`budget_type`、`target_gender`、`looking_for_count`、`status` |
 | `trip_post_tags` | 行程標籤 | **一列一標籤**（複合主鍵 `(trip_post_id, tag)`）取代 JSON 欄位；`ix_trip_post_tags_tag` 讓標籤篩選走索引而非記憶體掃描；標籤一律正規化為大寫、去重 |
 | `trip_applications` | 旅伴申請 | 狀態機 `PENDING → ACCEPTED/REJECTED`；`UNIQUE(trip_post_id, applicant_id)` 防重複申請 |
 | `chat_rooms` / `chat_room_members` | 聊天室 | 成員表是 WS 授權的**唯一依據**；`room_type` 為 `DIRECT` / `TRIP` |
@@ -129,9 +130,9 @@ Trip Mate 解決「**想找人一起去旅行，但不知道找誰、也不敢�
 ```
 backend/app/     62 個 Python 檔案（53 個模組 + 9 個 package `__init__.py`）
 frontend/src/    38 個 TS/TSX 檔案（11 個頁面 + 8 個元件 + 12 個 UI 元件 + 6 個 lib，含 i18n 字典與 provider）
-backend/tests/   295 個測試（整合流程 + 遷移 + 標籤 + Token 撤銷 + KV 容錯 + SMS + 雜湊卸載 + 通知 + 群組房 + 稽核 + 可觀測性 + 評價授權 + 內容審核 + 申請決策 + 上傳與足跡寫入 + 角色 CLI）
-frontend/e2e/    15 個 Playwright 測試（4 個 spec，真實瀏覽器 × 真實後端）
-API 端點         50 個 HTTP 端點 + 1 個 WebSocket 端點（另有 `/metrics`，預設關閉）
+backend/tests/   344 個測試（整合流程 + 遷移 + 標籤 + Token 撤銷 + KV 容錯 + SMS + 雜湊卸載 + 通知 + 群組房 + 稽核 + 可觀測性 + 評價授權 + 內容審核 + 申請決策 + 上傳與足跡寫入 + 城市查詢 + 城市關聯寫入驗證 + 角色 CLI）
+frontend/e2e/    22 個 Playwright 測試（5 個 spec，真實瀏覽器 × 真實後端）
+API 端點         52 個 HTTP 端點 + 1 個 WebSocket 端點（另有 `/health` 與 `/metrics`；`/api/v1/cities` 與 `/api/v1/cities/{city_id}` 為本次新增的城市端點）
 ```
 
 ---
@@ -188,16 +189,18 @@ API 端點         50 個 HTTP 端點 + 1 個 WebSocket 端點（另有 `/metric
 **工程**
 - `docker-compose.yml`（Postgres + Redis + API + Web）
 - 兩份 Dockerfile、兩份 `.env.example`、`.gitignore`
-- **Alembic 遷移**（4 支，`alembic check` 回報無漂移）：
+- **Alembic 遷移**（5 支，`alembic check` 回報無漂移）：
   - `c75898845cf5_initial_schema_11_tables.py` — 初始結構（11 張表）
   - `390180f865f7_add_notifications_table.py` — 新增 `notifications`（累計 12 張表 / 24 索引）
   - `cafc59ae9ecc_trip_post_tags_join_table.py` — `trip_posts.tags` JSON → `trip_post_tags` join table；**先回填再刪欄**，升級不丟資料，降級可由 join table 重建 JSON
-  - `619d0806a0cd_add_audit_logs_table.py` — 新增 `audit_logs`（累計 **14 張表 / 28 索引**）；兩個複合索引分別對應「這個帳號做過什麼」與「這週所有封鎖」
+  - `619d0806a0cd_add_audit_logs_table.py` — 新增 `audit_logs`（累計 13 張表 / 28 索引）；兩個複合索引分別對應「這個帳號做過什麼」與「這週所有封鎖」
+  - `2cc02c1a66dd_add_cities_reference_table_and_city_id_.py` — 新增 `cities` 參考表，並在 `trip_posts` / `travel_histories` 加上 `city_id`（FK，`ON DELETE SET NULL`，累計 **15 張表 / 32 索引**）；`SET NULL` 而非 `CASCADE` 是刻意的 —— 重新匯入 GeoNames 會替換所有參考列，`CASCADE` 會連帶刪掉使用者行程
   `init_db()` 偵測到 `alembic_version` 即讓位給 Alembic，生產環境完全跳過 `create_all`
-- 測試 281 個：
+- 測試 344 個：
   - `tests/test_api_flow.py` — 端到端主流程 + 登入反枚舉／時間差 + **行程詳情不得 500**（23）
   - `tests/test_content_filter.py` — 本地規則判定、**合法旅遊文字不得被誤擋**（25 句語料）、零寬／全形繞過、**錯誤訊息不得洩漏命中的詞或規則**、供應商 fail-open／fail-closed、每個寫入端點與 WebSocket（98）
-  - `tests/test_observability.py` — 遮蔽（含遞迴與子樹整棵遮蔽）、請求 id 的 per-task 隔離、**日誌注入防禦**、指標基數（路由範本而非原始路徑）（36）
+  - `tests/test_cities.py` — 城市建議端點：**前綴比對走 asciiname 而非 name**（帶重音的名稱仍可用純 ASCII 查到）、`LIKE` 特殊字元轉義、最小查詢長度、國家篩選、**席次加成優先於人口**（首都勝過同名前綴的較大城市）、三段席次排序、以及 `city_id` 寫入驗證與 `ON DELETE SET NULL`（49）
+  - `tests/test_observability.py` — 遮蔽（含遞迴與子樹整棵遮蔽）、請求 id 的 per-task 隔離、**日誌注入防禦**、指標基數（路由範本而非原始路徑）（38）
   - `tests/test_reviews.py` — **評價必須綁定雙方共同參與的那趟行程**（不可用別的行程 id 重放）、已拒絕／待處理的申請不解鎖評價、同一對旅伴的多趟行程可各評一次、封鎖後評價不可讀（10）
   - `tests/test_manage_roles.py` — 角色 CLI 的**護欄**：撤銷最後一位管理員需 `--force`、已刪除的帳號不得升為管理員、目標資料庫會遮蔽密碼（14）
   - `tests/test_audit.py` — **RBAC 大小寫**、稽核列與狀態變更同一個交易、`detail` 只留 enum／數量、註銷後 `SET NULL`、**唯讀性（結構＋HTTP）**（33）
@@ -210,6 +213,7 @@ API 端點         50 個 HTTP 端點 + 1 個 WebSocket 端點（另有 `/metric
   - `tests/test_password_offload.py` — Argon2 卸載至工作線程、event loop 不被阻塞（7）
   - `tests/test_trip_group_room.py` — 行程群組成員推導、擁有者權限、重複開房（6）
   - `tests/test_kv_resilience.py` — Redis 故障容錯與斷路器（5）
+  - `tests/test_applications.py` — 申請決策：只有行程擁有者可接受／拒絕、已決定的申請不得再改、拒絕後可重新申請（3）
 - `scripts/manage_roles.py` — **授予／撤銷 ADMIN 的維運 CLI**（`list` / `promote` / `demote`）。
   刻意**不提供 HTTP 端點**：能改角色的端點就是一個等著被設錯的提權路徑。
   這也是「第一個管理員」唯一的建立方式 —— 沒有它，管理介面根本進不去。
@@ -242,44 +246,49 @@ API 端點         50 個 HTTP 端點 + 1 個 WebSocket 端點（另有 `/metric
 | ✅ **P0** | Refresh Token 撤銷清單 | **已完成**：`services/token_store.py` 以 `jti` deny-list + 每用戶 epoch 實作撤銷、輪替與洩漏重用偵測；登出／改密碼即時失效 |
 | ✅ **P0** | 首個 Alembic 遷移 | **已完成**：`c75898845cf5_initial_schema_11_tables.py`；並有測試證明其與 `create_all` 結構一致 |
 | ✅ **P0** | 真實 SMS gateway | **已完成**：`services/sms.py` 可插拔供應商（`console` / `webhook`）；生產啟動時檢查並警告 |
-| ✅ **P0** | 前端 E2E 測試 | **已完成**：Playwright 15 個測試覆蓋「註冊 → OTP → 發文 → 申請 → 接受 → 通知 → 行程群組 → 聊天」，另加語言切換與管理後台；**上線首跑即抓到一個 500 真 bug**（見下方技術債 #9） |
+| ✅ **P0** | 前端 E2E 測試 | **已完成**：Playwright 22 個測試覆蓋「註冊 → OTP → 發文 → 申請 → 接受 → 通知 → 行程群組 → 聊天」，另加語言切換、管理後台與城市選擇器；**上線首跑即抓到一個 500 真 bug**（見下方技術債 #9） |
 | ✅ **P1** | 頭像上傳 UI | **已完成**：`components/AvatarUploader.tsx`（hover 上傳、前端先驗證型別／大小再走 multipart） |
 | ✅ **P1** | 通知系統 | **已完成**：`notifications` 表 + 5 個端點 + Navbar 鈴鐺（30 秒輪詢 + `window.focus` 重同步）；**封鎖即靜音** |
 | ✅ **P1** | 管理後台 | **已完成**：`/admin` 檢舉佇列（角色閘門、狀態篩選、403 視為預期結果） |
 | ✅ **P1** | 行程群組聊天室 UI | **已完成**：`/trips/[id]` 的「行程群組」按鈕（需先接受至少一位旅伴）；後端改為由 ACCEPTED 申請推導成員 |
 | ✅ **P2** | 標籤改用 join table | **已完成**：`trip_post_tags`（複合主鍵 + `ix_trip_post_tags_tag`）取代 JSON 欄位。篩選改為索引驅動的半連接，**精確且無上限**；標籤統一正規化為大寫並去重。附遷移（先回填再刪欄）與 8 個測試 |
 | ✅ **P2** | 內容審核 | **已完成**：`services/content_filter.py` —— 本地高精確度規則（`BLOCK` / `FLAG`）+ 可插拔供應商，接上全部 6 個文字寫入面（含 WebSocket），附 98 個測試 |
-| ✅ **P2** | 多語系 i18n | **已完成**：`lib/i18n/` 型別化字典（332 鍵 × 2 語言）+ cookie locale + 語言切換器；**全數 21 個檔案、約 340 行字串已抽離**，`npm run check:i18n` 把「不得再出現硬編碼漢字」與「不得有沒人用的鍵」變成可執行的檢查 |
+| ✅ **P2** | 多語系 i18n | **已完成**：`lib/i18n/` 型別化字典（341 鍵 × 2 語言）+ cookie locale + 語言切換器；**全數 21 個檔案、約 340 行字串已抽離**，`npm run check:i18n` 把「不得再出現硬編碼漢字」與「不得有沒人用的鍵」變成可執行的檢查 |
 | ✅ **P2** | 可觀測性 | **已完成**：結構化日誌（雙格式 + 請求關聯 + 統一遮蔽）、`/metrics`（路由範本標籤）、唯讀稽核軌跡表 + `/admin` 稽核頁籤；附 71 個測試 |
-| **P3** | 行程地圖 | **選型已定，實作待做**：見下方「P3 行程地圖：選型決策」。**真正的阻塞點不是圖層，而是隱私規則** —— 現行 §2.2 只准存國家／城市，地圖需要座標，放寬與否需先決定 |
+| ✅ **P3** | 行程地圖 + 城市參考表 | **已完成**：Leaflet + OpenStreetMap 圖磚；座標來源是 GeoNames `cities5000` 參考表（`city_id` FK），**使用者永遠無法寫入座標**。含城市選擇器、`/cities` 端點、匯入腳本、降級契約與 3 個 E2E。設計見 `docs/ARCHITECTURE.md` §15 |
 
-#### P3 行程地圖：選型決策
+#### P3 行程地圖：選型與隱私衝突的解法
 
-**已決定採用 Leaflet。** 理由：
+**採用 Leaflet。** 理由：
 
-1. **規模匹配。** 本功能只需要「在世界地圖上標城市點、連成行程線」——
+1. **規模匹配。** 本功能只需要「在世界地圖上標城市點」——
    Leaflet 的 42 KB、穩定的 API、成熟生態完全夠用，不需要 WebGL 向量渲染。
 2. **複雜度更低。** MapLibre 的優勢在向量圖磚、平滑縮放、大量圖層；
    這些在這個用例用不到，卻要付出樣式規格（style JSON）的學習與維護成本。
 3. **授權最寬鬆。** Leaflet 為 BSD-2-Clause，可自由商用與修改，無歸屬義務負擔。
 
-**圖磚來源**：起始用 OpenStreetMap 官方圖磚（遵守 attribution 與使用政策）；
+**圖磚來源**：用 OpenStreetMap 官方圖磚（遵守 attribution 與使用政策）；
 流量上升後換 CDN 或自架，程式碼不需改動（只換 tile URL）。
 **不使用天地圖**：其唯一優勢是「中國境內合規」，而本 App 已確認為非境內使用；
 加上它是為境內設計的服務（海外存取延遲較高），且免費條款以境內主體為前提，
 對境外使用語焉不詳 —— 引入它反而增加合規不確定性。
 
-**實作前必須先解決的前置問題（這才是真正的阻塞點）**：
+**原本的阻塞點不是圖層，而是隱私規則 —— 已解決。**
 
-- `models/trip.py` 目前**只存** `destination_country` / `destination_city` 兩個
-  自由文字欄位，**沒有座標**；docstring 明說寬度粗化是為了遵守精確位置隱私規則
-  （`docs/SECURITY.md` §2.2，目前列為合規項 ✅）。
-- 要在圖上標點，就得**新增經緯度** —— 這等於**提高位置精度**，與 §2.2 直接衝突。
-  因此必須先決定：**放寬隱私規則**（可接受），或**改存粗略座標**（如城市中心點，
-  精度與「城市」等價，不洩漏更多資訊）。
-- 其次要處理**地理編碼**：把自由文字城市名轉成座標，並處理歧義
-  （`Paris` 是法國還是德州）、查不到、使用者亂填等情況。
-  Nominatim 免費但限速嚴格；商業 API 需付費。**這是一條新的資料處理鏈，不是接圖層。**
+`models/trip.py` 原本只存 `destination_country` / `destination_city` 兩個自由文字
+欄位、沒有座標，而寬度粗化正是為了遵守精確位置隱私規則。在圖上標點就得新增經緯度，
+等於提高精度。解法是**把座標來源做成參考表，而不是使用者輸入**：
+
+| 問題 | 解法 |
+|------|------|
+| 精度與隱私規則衝突 | 座標只從 `cities` 參考表取**城市中心**（約公里級）。城市名本身就洩漏同等資訊，故**不增加**可識別性；`docs/SECURITY.md` §2.3 |
+| 自由文字城市名的歧義 | 城市改為從 GeoNames 挑選（`city_id` FK），**廢除自由文字寫入路徑** |
+| 地理編碼鏈（歧義、查不到、亂填） | **不需要** —— 沒有自由文字，就沒有地理編碼。這是選參考表的主要原因 |
+| 配對因拼寫不一致而靜默失敗 | 同上：無法驗證的輸入不能參與逐字比對 |
+| 重新匯入 GeoNames 會刪掉使用者資料 | FK 動作為 `ON DELETE SET NULL`，非 `CASCADE` |
+
+`destination_city` 的字串欄位**保留**：它是卡片渲染用的顯示值，且在城市列被移除後仍存活。
+`city_id` 則讓城市**可驗證**，也是地圖取得座標的途徑。
 
 ### ⚠️ 已知技術債
 
@@ -319,7 +328,15 @@ API 端點         50 個 HTTP 端點 + 1 個 WebSocket 端點（另有 `/metric
    照著做不會有任何效果（與技術債 #4 同類的「文件與實作不符」）。
    已改為寫出真實的兩項前置條件：金鑰由 `SECRET_KEY` 衍生（**輪換即讓既有密文無法解開**，
    且 `decrypt_value` 靜默回 `None`），以及 `_fernet` 在 import 時建立。
-6. **WS 狀態存於單程序記憶體**：多副本部署需改用 Redis Pub/Sub。
+6. ~~**WS 狀態存於單程序記憶體**：多副本部署需改用 Redis Pub/Sub。~~ **已解**：
+   `ws/pubsub.py` 提供 Redis Pub/Sub 跨副本扇出，`ConnectionManager.broadcast` 改為
+   「先本地投遞，再發布到房間 channel」。**降級契約**與 `kv.py` 同源：Redis 不可用時
+   退回單程序行為（本地照常投遞）並**記錄一次 warning**——因為「只送達一半房間」從送出端
+   看起來與成功完全一致，日誌是唯一的外部訊號。
+   兩個必須知道的細節：(a) 自有回音以 `instance_id` 過濾（否則每則訊息重複投遞）；
+   (b) `exclude` 隨訊息跨副本傳遞，由持有該 socket 的副本套用（否則被排除者會經由
+   另一副本收到自己的 typing）。**已釘住**：停用任一守衛 → `tests/test_ws_fanout.py` 變紅（4/4）。
+   仍未覆蓋（需真實 Redis 的整合測試）：認證、伺服器端斷線後重連、斷路器對真實不可達主機的行為。
 7. **前端未做狀態管理庫**：目前用 React Context，規模變大後建議引入 TanStack Query 處理快取。
 8. **雜湊線程池為程序層級**：`PASSWORD_HASH_MAX_CONCURRENCY` 是**每程序**上限，
    多副本部署時總並發為「副本數 × 上限」，需據此調整記憶體規劃。
@@ -452,26 +469,33 @@ API 端點         50 個 HTTP 端點 + 1 個 WebSocket 端點（另有 `/metric
    之類的型別被存入上傳桶的檢查。測試因此改為**直接呼叫 service 函式**把這道守衛釘住，
    HTTP 層則只斷言「local 後端下一律是那個 400」。
 
-22. **多副本部署前置清單（目前單副本部署，此項為待辦）**：以下五個問題**同源** ——
-   全都來自「狀態存在行程記憶體」或「缺乏跨行程協調」。目前 `docker-compose.yml`
-   的 `api` 服務是**單一實例**、`Dockerfile` 的 `CMD` 也**沒有 `--workers`**，
-   因此它們**現在都不會觸發**。一旦水平擴展（K8s、多台 VM、或僅是
-   `uvicorn --workers N`），全部必須**一起處理** —— 分開修等於同一個架構決策改五次。
+22. **多副本部署前置清單（已全部結案）**：以下問題**同源** —— 全都來自
+   「一個**每行程**各算一次的量測，被當成整個部署的事實」。單副本時兩者完全等價，
+   這正是它們長期只被記錄、沒有被修的原因。一旦水平擴展（K8s、多台 VM、或僅是
+   `uvicorn --workers N`），**全部會同時觸發**。
 
    | 項目 | 現狀 | 多副本下的表徵 |
    |------|------|--------------|
-   | **#6 WS 狀態** | `ws/manager.py` 的 `_rooms` / `_buckets` 為行程記憶體 | **最嚴重**：A 副本用戶與 B 副本用戶互相看不到 `broadcast()` → **聊天訊息單向丟失**，且不報錯。`is_member_online` 也會給錯答案 |
-   | **#3 限流** | `rate_limit.py` Redis 不通則退 `memory://` | Redis 故障時每個副本各自計數 → 實際限額 = 副本數 × 限額，限流形同虛設 |
-   | **#8 雜湊池** | `PASSWORD_HASH_MAX_CONCURRENCY = 8`（每程序） | 總並發 = 副本數 × 8；Argon2 每次約 64 MiB → 4 副本峰值約 2 GB，容器易被 OOM kill |
-   | **TOCTOU**（#20 殘留） | 容量檢查是「先讀後寫」，中間無鎖 | 兩個併發請求可雙雙通過 `already_accepted < looking_for_count` → **安靜地超收旅伴**（不報錯） |
-   | **KV 斷路器** | `kv.py` 的 `_redis_disabled` / `_breaker_open()` 為模組級變數 | Redis 故障時**每個副本各學一次**「Redis 壞了」→ 故障期間每個副本各吃一輪失敗請求 |
-   | **`app.seed` 競態** | `docker-compose.yml` 啟動時跑 `python -m app.seed \|\| true` | 多副本同時執行 seed → 可能產生重複種子資料或競態（目前靠 `\|\| true` 不致命，但應改為獨立 init job） |
+   | **#6 WS 狀態** | ✅ **已解**：`ws/pubsub.py` Redis Pub/Sub 扇出 + 每人配額外部化 + presence 註冊表 | 聊天訊息單向丟失且不報錯 → **已修**。`_buckets` → `kv.DistributedTokenBucket`（跨副本共享）。**presence** → `kv.PresenceRegistry`（每副本一個 TTL 條目，讀取取聯集；心跳重寫名單，所以漏掉的 `leave` 會自我修復）。`is_member_online` **刻意保持本副本語意**（它回答「我能不能投遞」，是路由問題） |
+   | **#3 限流** | ✅ **已解**：`rate_limit.SharedCounter` 走同步 redis client + 斷路器 | 實際限額 = 副本數 × 限額 → **已修**：Redis 健康時配額全域共享。Redis 不可用時**仍降級為每副本**（刻意，可用性優先），但會告警並說明配額被放大 |
+   | **#8 雜湊池** | ✅ **已解**：`kv.DistributedSemaphore` 取全域 permit；anyio 線程池降為**每行程後備** | 總並發 = 副本數 × 8；Argon2 每次約 64 MiB → 4 副本峰值約 2 GB，易被 OOM kill → **已修**。取不到 permit 時**等待 2.5 秒再放行**，絕不因忙碌而拒絕登入；Redis 不可用時啟動即**以記憶體算術告警** |
+   | **#21 TOCTOU** | ✅ **已解**：狀態轉移改**條件式 UPDATE**（`rowcount` 仲裁）＋ 讀取前先取**寫鎖**（PG：`FOR UPDATE`；SQLite：對該列的 no-op 寫入） | 兩個併發接受可雙雙通過容量檢查 → **安靜超收** → **已修**。**實測**：只留 CAS 而移除寫鎖 → 兩個並行接受都回 200、`looking_for_count=1` 的行程有 2 位旅伴；補上寫鎖 → `[200, 409]`、1 位 |
+   | **#22a KV 斷路器** | ✅ **已解**：狀態移入 `kv._BreakerState`；`RedisBreakerBackend` 發布窗口 | 故障期間每個副本各吃一輪失敗請求 → **已修**。**刻意仍是 publisher 而非依賴源** —— 讀取失敗一律退回本地，否則「需要 Redis 才知道 Redis 掛了」 |
+   | **#22b `app.seed`** | ✅ **已解**：seed 全程包在 `pg_advisory_lock` 內 | 多副本同時 seed → 重複種子資料或競態。逐列存在性檢查**只對循序重跑有效**，併發時大家都在任何 commit 之前讀到「不存在」 |
 
    **特別注意**：很多人以為「還沒上 K8s，只是加幾個 `--workers`」很安全 ——
-   **不對**。`uvicorn --workers 4` 就是多行程，**#6 已經觸發**。這是本清單裡
-   最容易被低估的一項。
+   **不對**。`uvicorn --workers 4` 就是多行程，**#6 已經觸發**。
 
-   建議處理順序：**#6 → #3 → #8 → TOCTOU → KV 斷路器 → seed**。
+   建議順序：~~#6~~ → ~~#3~~ → ~~#8~~ → ~~#21~~ → ~~#22a~~ → ~~#22b~~（**全部完成**）。
+   負向驗證：多副本硬化 9 個突變全紅（`tests/test_multi_replica_hardening.py`）＋
+   presence 10 個突變全紅（`tests/test_presence_registry.py`）。
+   **#6 的最後一項 presence 已於 2026-09-27 修完**，多副本前置清單全清。
+
+   > ⚠️ **這一輪最貴的一課**：**「#21 修好了」在單執行緒測試下無法證明。**
+   > 第一版修法（只在 PG 加 `FOR UPDATE` ＋ CAS）在既有測試與新增的循序測試下**全綠**，
+   > 但用 `httpx.ASGITransport` 真的併發送出兩個接受請求時，**兩個都回 200、超收 2 位**。
+   > **對賽跑，延遲與真正併發才是讓突變可觀測的東西**；循序測試只證明「檢查還在」，
+   > 不證明「檢查有效」。修好後的測試同時斷言**回應狀態**與**落地狀態**兩側。
 
 ---
 
@@ -570,13 +594,13 @@ npm run dev
 **測試**
 
 ```bash
-cd backend && pytest -q          # 295 passed
+cd backend && pytest -q          # 469 passed
 cd frontend && npm run typecheck # 0 errors
 cd frontend && npm run lint      # 0 warnings（next/core-web-vitals）
 cd frontend && npm run check:i18n # 字典同步、無硬編碼字串
 cd frontend && npm run build     # 12 routes（10 static + 2 dynamic）
 cd frontend && npm run check:prod # production build 實測：標頭齊全、CSP violation 為 0
-cd frontend && npm run test:e2e  # 15 passed (Playwright，自行啟動前後端)
+cd frontend && npm run test:e2e  # 22 passed (Playwright，自行啟動前後端)
 ```
 
 `check:prod` 需要先跑過 `npm run build`（它自己起停 `next start`，不負責建置）。
@@ -629,14 +653,14 @@ cd frontend && E2E_NO_WEBSERVER=1 npm run test:e2e
 
 | 檢查 | 指令 | 結果 |
 |------|------|------|
-| 後端測試 | `pytest -q` | **295 passed**（約 28 秒） |
+| 後端測試 | `pytest -q` | **469 passed**（300 秒；26 個 spec 檔） |
 | 前端型別檢查 | `npm run typecheck` | **0 errors** |
-| i18n 完整性 | `npm run check:i18n` | **332 鍵、zh-HK 與 en 完全同步、字典外零漢字、且無未被引用的鍵** |
+| i18n 完整性 | `npm run check:i18n` | **359 鍵、zh-HK 與 en 完全同步、字典外零漢字、且無未被引用的鍵** |
 | 前端靜態分析 | `npm run lint` | **0 warnings**（`next/core-web-vitals`；首次導入即抓到 9 個 `react-hooks/exhaustive-deps`，見技術債 #18） |
 | 前端生產建置 | `npm run build` | **✓ 12 routes**（10 靜態預渲染 + 2 動態） |
 | production 標頭與 CSP | `npm run check:prod` | **7 條路由全 200、6 個安全標頭齊備、CSP violation 0**（在真實 production build 上開 Chromium；已用注入的損壞 CSP 反向驗證會失敗） |
-| 前端 E2E | `npm run test:e2e` | **15 passed**（真實 Chromium × 真實 uvicorn；含雙人配對全流程與管理後台） |
-| 路由註冊 | `app.routes` | 50 個 HTTP + 1 個 WebSocket 端點 |
+| 前端 E2E | `npm run test:e2e` | **22 passed**（真實 Chromium × 真實 uvicorn；含雙人配對全流程、管理後台、城市選擇器與稽核清單亂序防護） |
+| 路由註冊 | `app.routes` | 52 個 HTTP（`/api/v1`）+ 1 個 WebSocket + `/health` |
 | 稽核軌跡唯讀 | 結構掃描 + HTTP | 無任何 `POST/PUT/PATCH/DELETE` 路由指向 `/admin/audit-logs`；模型亦無 `updated_at` 欄位 |
 | 日誌注入防禦 | `X-Request-ID` 夾帶換行 | 非 `[A-Za-z0-9._-]` 一律拒絕並改發新 id；偽造字串不出現在回應標頭或任何日誌行 |
 | 指標基數 | `/api/v1/trips/<uuid>` | 標籤為 `/api/v1/trips/{trip_id}`；回應內**不含**任何真實 id |

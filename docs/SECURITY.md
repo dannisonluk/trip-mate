@@ -39,12 +39,34 @@ response.set_cookie(
 > `path` 限定為 `/api/v1/auth` 是關鍵設計：一般 API 請求根本不會攜帶此 Cookie，
 > 即使發生 CSRF 也無法用它換取新的 Access Token。
 
+**`COOKIE_DOMAIN` 必須保持為空字串（host-only）。** 空值會讓 `domain` 參數整個被省略，
+Cookie 因此只回送到**設定它的那一個主機**，不會流向同網域的其他子網域。
+若填成 `.example.com`，任何被接管的子網域（行銷頁、舊後台、客戶自建的 CNAME）
+都能讀到登入 cookie —— 這是典型的 subdomain takeover 提權路徑。
+
+> **不要用 `__Host-` 前綴取代這個設定。** `__Host-` 名稱要求
+> `Path=/` **且不得有 `Domain` 屬性**，而本 Cookie 的 `path` 刻意收窄到
+> `/api/v1/auth` —— 兩者**在規範上不相容**。
+> 要改用 `__Host-` 就得把 path 放寬為 `/`，等於**放棄**上面那條 CSRF 縮小暴露面的設計，
+> 換來的只是「防止誤設 Domain」這一道**啟動期檢查**即可達成的保證。
+> 成本大於收益，故不採用。
+>
+> **已實作（`core/config.py::_cookie_domain_must_be_empty_in_production`）**：
+> `field_validator("COOKIE_DOMAIN")` 在 `ENV=production` 且值非空時拋 `ValidationError`
+> —— **行程在建構 settings 時就拒絕啟動**，不是等到第一個登入請求才發現。
+> 理由與 `require_role` 對未知角色名稱拋 `ValueError` 相同：
+> **會靜默失效的保證不算保證。**
+> 護欄刻意只鎖 production：staging／development 仍允許設定（單主機多埠是正常的 dev 情境，
+> 一道在開發期就會觸發的護欄只會被繞過）。負向驗證：停用該 validator →
+> `tests/test_config.py::test_production_rejects_a_cookie_domain` 變紅（1/1 釘住）。
+
 ### 1.2 密碼安全
 
 | 要求 | 狀態 | 實作位置 |
 |------|------|----------|
 | Argon2id 雜湊 | ✅ | `security.py`：`PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)` |
-| 雜湊不阻塞 event loop | ✅ | Router 呼叫 `hash_password_async` / `verify_password_async`，以 `anyio.to_thread.run_sync` 移出；argon2 釋放 GIL 故並發雜湊可平行。線程池以 `PASSWORD_HASH_MAX_CONCURRENCY` 設上限（每次 64 MiB） |
+| 雜湊不阻塞 event loop | ✅ | Router 呼叫 `hash_password_async` / `verify_password_async`，以 `anyio.to_thread.run_sync` 移出；argon2 釋放 GIL 故並發雜湊可平行 |
+| 雜湊並發受**全域**上限約束 | ✅ | 兩層：`kv.DistributedSemaphore`（**跨副本**，`PASSWORD_HASH_MAX_CONCURRENCY` 是整個部署的 64 MiB×N 記憶體預算）＋ anyio 線程池上限（**每行程**後備，Redis 不可用時仍生效）。取不到 permit 時**等待 2.5 秒再放行**，不拒絕登入 |
 | 最小 8 位 + 大小寫 + 數字 | ✅ | `security.py::validate_password_policy`（註冊與改密碼皆驗證） |
 | 防止帳號枚舉（訊息層） | ✅ | 登入失敗與不存在帳號回傳**相同** `401 Invalid credentials` |
 | 防止帳號枚舉（時間層） | ✅ | `login()` 先判斷帳號存在性；不存在時呼叫 `security.py::verify_password_dummy()` 對固定 dummy hash 執行**一次等價 Argon2 驗證**，再回傳同一個 401。實測兩條路徑中位數 **38 ms vs 36 ms（1.05×）** |
@@ -91,7 +113,8 @@ response.set_cookie(
 | 電話號碼永不外洩至他人 | ✅ | `schemas/profile.py::ProfilePublic` **不含**電話欄位；`ProfileSummary` 亦然 |
 | 遮蔽工具單一來源 | ✅ | `services/pii.py::mask_phone`（`+852 9*** *123`）／`mask_email` |
 | 聊天中洩漏電話的主動提醒 | ✅ | `services/pii.py::is_phone_like`，命中時 WS 對發送者回 `safety_hint` |
-| 精確位置隱私（只存國家／城市） | ✅ | `models/trip.py` **沒有**地址欄位；`trip_posts` 僅 `destination_country/city` |
+| 精確位置隱私（只存城市層級座標） | ✅ | 座標**只**來自 `cities` 參考表的市中心值，`trip_posts.origin_*` 不存在、`travel_histories` 亦無地址欄位 |
+| 使用者提供的座標永不落庫 | ✅ | 任何寫入路徑都只接受 `city_id`（整數 FK），**不接受**經緯度；`resolve_city_id()` 驗證其存在，見 §2.3 |
 | 不強迫公開住宅地址 | ✅ | 城市欄位選填 |
 | 欄位級加密（Fernet） | 🟡 | `services/crypto.py` 已實作，但**目前無呼叫點**——電話改為登入識別碼後不再作為 profile 欄位儲存 |
 
@@ -104,6 +127,51 @@ response.set_cookie(
 >    這個設定 —— 舊版 docstring 曾叫人去設它，那是錯的（設定不存在，照做不會有任何效果，
 >    已修正）。真要上線使用，必須先引入一把可獨立輪換的金鑰。
 > 2. `_fernet` 在 **import 時**建立，所以 import 此模組要求 `SECRET_KEY` 已載入。
+
+### 2.3 位置資料：只有城市層級座標，永不儲存使用者提供的位置
+
+地圖功能需要座標，而「需要座標」與「不收集位置」之間的張力必須明確定義，否則實作會
+在壓力下選錯方向。
+
+**規則**：資料庫中**唯一**的座標來源是 `cities` 參考表，其值取自 GeoNames 的**市中心**。
+使用者端**永遠無法**寫入座標。
+
+| 面向 | 決定 | 理由 |
+|------|------|------|
+| 座標粒度 | 市中心一點（約公里級） | 城市名本身就洩漏了同等資訊，因此儲存市中心**不增加**任何可識別性 |
+| 座標來源 | GeoNames `cities5000`（CC BY 4.0） | 離線資料集，無運行時故障模式，亦不受第三方快取條款限制 |
+| 寫入介面 | 只有 `city_id`（整數 FK），**沒有** lat/lon 參數 | 無法被誤用：不在 API 表面的欄位就不能被填錯 |
+| 驗證 | `cities.py::resolve_city_id()`，不存在的 id → 422 | 見下方「為何寧可拒絕」 |
+| 城市刪除時 | `ON DELETE SET NULL` | 重新匯入 GeoNames 會替換所有參考列；`CASCADE` 會連帶刪掉使用者行程 |
+
+**為何是「選單」而不是自由輸入的文字。** 配對引擎以字串**逐字**比較目的地城市
+（`services/matching.py`），所以 `Osaka`、`osaka`、`Ōsaka`、`大阪` 是四個不同的值。
+使用者若輸入了與對方不同的拼寫，就會**靜默地**永遠配對不上，而且沒有任何線索。
+因此城市只能從已知集合中挑選；見 `components/CityPicker.tsx`。
+
+**為何寧可拒絕一個不存在的 id，而不是接受它。** 一個無法解析的 `city_id` 比拼錯的字串
+**更糟**：列看起來是填好的（非 `NULL`），於是每一層都當它有效，而配對永遠不成立 ——
+一個沒有錯誤訊息的錯誤答案。`resolve_city_id()` 因此在寫入時就回 422。
+
+> 測試：`tests/test_cities.py::TestCityReferenceIsValidatedOnWrite`（含
+> `test_deleting_the_city_row_does_not_delete_the_trip`，實測 `SET NULL`）。
+
+> **Leaflet 地圖的降級行為**：地圖只是呈現層，由 `components/CityMapLoader.tsx`
+> （server-safe，負責解析與決策）與 `components/CityMap.tsx`（Leaflet，經
+> `next/dynamic` + `ssr: false` 載入）分擔。取不到圖磚時（離線、CSP 封鎖、圖磚服務
+> 故障）必須退化為「城市名稱 + 國家」的文字，**不得**讓行程詳情頁因此失效。
+> 座標缺失的列（`city_id IS NULL`）本就不會進入地圖描繪路徑。
+>
+> 三種失敗都不顯示錯誤：`city_id` 為 `NULL`、id 解析不到（GeoNames 重新匯入後
+> `ON DELETE SET NULL` 會讓行程失去城市，此時 `GET /cities/{city_id}` 的 `404`
+> 是**預期結果**）、以及請求或圖磚失敗。行**程詳情頁永遠自己以文字顯示城市與國家**，
+> 那段文字才是主要呈現。
+>
+> 座標以**完整精度**顯示原始值（非四捨五入）：儲存值本身就是 GeoNames 的城市中心，
+> 顯示得比它更粗略只會讓使用者看到一個資料庫裡不存在的數字，並不增加隱私。
+> 縮放固定在 10（約城市與近郊）—— 更近的縮放會暗示我們沒有主張的精確度。
+> 詳見 `docs/ARCHITECTURE.md` §15.10。
+
 
 ---
 
@@ -127,8 +195,8 @@ response.set_cookie(
 | 被封鎖者無法私訊／申請／開房 | ✅ | 申請：`trips.py::apply_to_trip`；開房：`chat.py::create_room`；發訊：`chat.py::send_message` |
 | 封鎖對**已開啟**的連線亦立即生效 | ✅ | `ws/routes.py::_persist_message` 於每次寫入前重新檢查封鎖關係 |
 | 封鎖為雙向生效 | ✅ | `moderation.py::is_blocked_between` 查兩個方向 |
-| WS 訊息限速 2 msg/s | ✅ | `ws/manager.py::TokenBucket`（rate=2, capacity=2） |
-| 敏感 API 限流 5 次／分鐘 | ✅ | `core/rate_limit.py`：`LOGIN_RATE` / `REGISTER_RATE` / `OTP_RATE` 套用於 `auth.py` |
+| WS 訊息限速 2 msg/s | ✅ | `manager.allow_message` → `services/kv.py::DistributedTokenBucket`（rate=2, capacity=2）。**配額存於共享儲存**，非每副本計數 |
+| 敏感 API 限流 5 次／分鐘 | ✅ | `core/rate_limit.py`：`LOGIN_RATE` / `REGISTER_RATE` / `OTP_RATE` 套用於 `auth.py`；計數經 `SharedCounter` 走共享儲存 |
 | 檢舉機制 | ✅ | `POST /api/v1/reports` + `GET/PATCH /api/v1/admin/reports`（僅 admin） |
 | 評價防刷分 | ✅ | `api/v1/reviews.py::_shared_trip_ids`——只有共同出遊過才能互評，否則 403；同一組合僅能評一次 |
 
@@ -189,13 +257,13 @@ response.set_cookie(
 | 風險 | 影響 | 現況 | 緩解建議 |
 |------|------|------|----------|
 | ~~登入時間差可區分帳號是否存在~~ | 低度帳號列舉 | ✅ 已解 | 對不存在帳號驗證固定 dummy hash，兩條路徑皆執行一次等價 Argon2（實測 38 ms vs 36 ms） |
-| Argon2 為 CPU-bound，可被用作資源耗盡 | 併發登入可拖慢整個服務 | 🟡 部分緩解 | 已移出 event loop（不凍結其他請求）並以 `PASSWORD_HASH_MAX_CONCURRENCY` 限制並發；但登入端點仍以每分鐘 5 次限流為主要防線，且限流在 Redis 故障時 fail-open |
+| Argon2 為 CPU-bound，可被用作資源耗盡 | 併發登入可拖慢整個服務 | 🟡 部分緩解 | 已移出 event loop（不凍結其他請求）；並發受 `PASSWORD_HASH_MAX_CONCURRENCY` 以**全域** semaphore 限制（過去僅每行程，N 副本即 N 倍 64 MiB）。登入端點另有每分鐘 5 次限流，但限流在 Redis 故障時降級為每副本 |
 | Access Token 無法即時撤銷 | 登出後 access token 仍有效至到期 | 🟡 刻意取捨：access 效期僅 15 分鐘，換取完全無狀態驗證 | 縮短效期，或加入 `jti` 黑名單檢查（會讓每個請求都查 KV） |
 | 撤銷狀態存於單機（無 Redis 時） | 多副本下各副本撤銷狀態不一致 | 🟡 無 Redis 時退回每程序記憶體 | 生產必須部署 Redis；`services/kv.py` 已就緒 |
 | OTP 於開發模式回傳 `dev_code` | 生產若誤設 `OTP_DEV_ECHO=true` 會洩漏驗證碼 | ✅ 已雙重防護：`is_production` 時強制不回傳，啟動時另發警告 | — |
 | CSP 的 `script-src` 含 `unsafe-inline`（`style-src` 亦然） | 降低 XSS 防護強度：注入的 inline script 不被瀏覽器攔截 | 🟡 **已調查，取捨明確**：nonce-based CSP 已實作並以真實 production build 驗證，**無法與靜態預渲染並存** —— 12 條路由有 10 條是 build-time prerender，預先渲染的 HTML 帶不了 per-request nonce，實測每張靜態頁 18 個 violation（且 nonce 讓 `strict-dynamic` 使 `'self'` 失效，連外部 chunk 都被擋）。目前選擇保留預渲染 | 二選一：改 `force-dynamic` 放棄預渲染以換取嚴格 `script-src`；或以 hash-based CSP 覆蓋已知 inline 腳本。**改動前必跑 `npm run check:prod`**，它會在 production build 上斷言 violation 為 0 |
 | `services/crypto.py` 無呼叫點 | 死碼，易誤以為欄位已加密；且其 docstring 曾叫人設一個**不存在的** `FIELD_ENCRYPTION_KEY` | 🟡 | 已修正 docstring 說出真實的兩項前置條件（金鑰由 `SECRET_KEY` 衍生 → 輪換即失效；`_fernet` 於 import 時建立）。保留作為未來聯絡欄位的唯一加密入口，或移除 |
-| WS 狀態存於單程序記憶體 | 多副本部署時房間狀態不一致 | 🔜 | Redis Pub/Sub 廣播（見 `docs/ARCHITECTURE.md` §6） |
+| WS 狀態存於單程序記憶體 | 多副本部署時房間狀態不一致 | ✅ 已解 | `ws/pubsub.py` Redis Pub/Sub 扇出 + `kv.DistributedTokenBucket` 每人配額。**殘留**：`online_profiles` 仍只反映本副本（presence 需共享成員註冊表）。見 `docs/ARCHITECTURE.md` §6、§16.8 |
 | 限流在 Redis 故障時 **fail-open** | 故障期間限流失效，暴力破解防護降級 | 🟡 刻意取捨：可用性優先於嚴格限流 | 監控告警 Redis 健康狀態；必要時改為 fail-closed 並接受登入中斷 |
 | ~~JSON 標籤以記憶體掃描篩選~~ | 貼文量大時查詢成本上升 | ✅ 已解 | 已改為 `trip_post_tags` join table，篩選為索引驅動且無上限（見 `docs/ARCHITECTURE.md` §10） |
 | ~~SQLite 不強制外鍵~~ | `ondelete=` 在 dev/test 方言上失效，與生產行為分歧 | ✅ 已解 | `db/session.py` 於 SQLite 連線開啟 `PRAGMA foreign_keys=ON`；`tests/test_tags.py` 以 ORM 無法代勞的 cascade 作為探針 |

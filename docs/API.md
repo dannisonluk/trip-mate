@@ -36,6 +36,68 @@ Base URL：`http://localhost:8000`
 
 ---
 
+## Cities `/api/v1/cities`
+
+城市參考表的查詢端點，供選擇器使用。**唯讀**：應用程式沒有任何路徑可以寫入
+`cities`，資料只由 `scripts/import_cities.py` 匯入（GeoNames `cities5000`，CC BY 4.0，
+見 `docs/ATTRIBUTION.md`）。
+
+| 方法 | 路徑 | 說明 |
+|------|------|------|
+| GET | `/api/v1/cities` | 前綴搜尋城市建議 |
+| GET | `/api/v1/cities/{city_id}` | 以 GeoNames id 取單一城市（含座標） |
+
+**查詢參數**（僅 `/cities`）
+
+| 參數 | 必填 | 預設 | 說明 |
+|------|------|------|------|
+| `q` | ✅ | — | 搜尋字串。**少於 2 個字元直接回空清單**（不打資料庫） |
+| `country` | — | — | ISO-3166 alpha-2，縮小到單一國家 |
+| `limit` | — | 10 | 回傳上限 |
+
+**排序**（依序）：席次加成（`PPLC` 首都 3 > `PPLA*` 行政中心 2 > 其他 0）→ 人口 → 名稱。
+席次加成**優先於人口**，因此 `San Marino`（首都，4,500）會排在美國的
+`San Marino`（13,464）之前 —— 這是刻意的：行政中心比同名的較大城鎮更可能是使用者指的那個。
+
+**比對的是 `asciiname` 而非 `name`**。14,419 個顯示名稱帶有重音（`Ōsaka`），
+而使用者通常以純 ASCII 輸入（`Osaka`）。`name` 只用於顯示。
+
+> **`city_id` 的寫入驗證**：`POST /trips`、`PATCH /trips/{id}`、
+> `POST /profiles/me/histories` 接受 `city_id`，但該 id 必須存在於 `cities`，
+> 否則回 **422**。這比接受任意整數更重要：一個解析不到的 id 會讓該列「看起來填好了」
+> 卻永遠比對不到，是沒有錯誤訊息的錯誤答案。`city_id` 另有 `ge=1` 下限。
+
+### `GET /cities/{city_id}`
+
+單一城市，含市中心座標。行程詳情頁的地圖用它把 `city_id` 換成座標。
+
+**為何不重用前綴搜尋**：行程存的是 `city_id`，若改用 `q=San Jose` 反查，回傳的是
+三個同名城市中**排序最高**的那個（哥斯大黎加的首都），往往不是行程當初存的那一個。
+只有按 id 查才保證每次都得到同一列。
+
+**404 是預期結果，不是異常**。城市列可能被 GeoNames 重新匯入時移除，而 FK 是
+`ON DELETE SET NULL`，所以行程的 `city_id` 會變成 `NULL`。前端據此退回顯示城市名稱
+純文字（地圖只是呈現層，見 `docs/SECURITY.md` §2.3）。
+
+<details>
+<summary>回應範例</summary>
+
+```json
+{
+  "id": 1850147,
+  "name": "Tokyo",
+  "country_code": "JP",
+  "country_name": "Japan",
+  "admin1_name": "Tokyo",
+  "population": 9733276,
+  "latitude": 35.6895,
+  "longitude": 139.69171
+}
+```
+</details>
+
+---
+
 ## Auth `/api/v1/auth`
 
 | 方法 | 路徑 | 限流 | 說明 |
