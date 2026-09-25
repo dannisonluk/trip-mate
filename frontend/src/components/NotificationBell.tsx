@@ -41,7 +41,7 @@ function typeAccent(type: string): string {
 
 export default function NotificationBell() {
   const router = useRouter();
-  const { t, formatDateTime } = useI18n();
+  const { t, serverText, formatDateTime } = useI18n();
   const [open, setOpen] = useState(false);
   const [unread, setUnread] = useState(0);
   const [items, setItems] = useState<Notification[]>([]);
@@ -209,7 +209,7 @@ export default function NotificationBell() {
                             !n.read_at ? "font-semibold" : "font-medium text-muted-foreground",
                           )}
                         >
-                          {n.title}
+                          {serverText("notif", n.code, n.params)}
                         </span>
                         {!n.read_at && (
                           <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />

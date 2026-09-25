@@ -8,7 +8,7 @@ import { Bell, CheckCheck, Inbox, Loader2, Trash2 } from "lucide-react";
 import { api, errorMessage } from "@/lib/api";
 import { RequireAuth } from "@/lib/auth";
 import type { Notification, NotificationPage } from "@/lib/types";
-import { useI18n } from "@/lib/i18n";
+import { useI18n, type I18nState } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,9 +22,41 @@ function hrefFor(n: Notification): string {
   return "/profile";
 }
 
+/**
+ * Turn the server's language-neutral `code` + `params` into a sentence.
+ *
+ * The server deliberately does not send the sentence: a notification row
+ * outlives the request that wrote it, so a title rendered at write time would
+ * be frozen in the writer's language and read wrong for everyone else.
+ *
+ * `t` is passed in rather than closed over so the caller keeps the locale
+ * dependency visible — this function has to be re-evaluated when the language
+ * changes, and a hidden closure would make that easy to forget.
+ *
+ * A code this build does not know falls through to the raw code. Ugly, but
+ * visible: a newer backend sending an unknown code should look wrong, not
+ * blank, or it reads as a rendering bug instead of a version mismatch.
+ */
+/**
+ * Turn the server's language-neutral `code` + `params` into a sentence.
+ *
+ * The server deliberately does not send the sentence: a notification row
+ * outlives the request that wrote it, so a title rendered at write time would
+ * be frozen in the writer's language and read wrong for everyone else.
+ *
+ * Delegates to the provider's `serverText` so the bell and this page cannot
+ * drift — both must resolve the same code to the same key.
+ */
+function notificationText(
+  n: Notification,
+  serverText: I18nState["serverText"],
+): string {
+  return serverText("notif", n.code, n.params);
+}
+
 function NotificationsContent() {
   const router = useRouter();
-  const { t, label, formatDateTime } = useI18n();
+  const { t, label, serverText, formatDateTime } = useI18n();
   const [data, setData] = useState<NotificationPage | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -184,7 +216,7 @@ function NotificationsContent() {
                         !n.read_at ? "font-semibold" : "font-medium text-muted-foreground",
                       )}
                     >
-                      {n.title}
+                      {notificationText(n, serverText)}
                     </p>
                     {n.body && (
                       <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{n.body}</p>

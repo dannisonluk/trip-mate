@@ -3,7 +3,8 @@ import path from "node:path";
 
 import { expect, type Browser, type BrowserContext, type Page } from "@playwright/test";
 
-import { BASE_URL, E2E_DB_FILE } from "./constants";
+import { BASE_URL, E2E_ADMIN_PHONE, E2E_DB_FILE } from "./constants";
+import { requestedAdminPhones } from "./out-of-band-roles";
 import { BACKEND_DIR, resolvePython } from "./python";
 
 /**
@@ -58,9 +59,12 @@ export async function newUserContext(browser: Browser): Promise<BrowserContext> 
 export async function registerUser(
   page: Page,
   nickname: string,
-  { verify = true }: { verify?: boolean } = {},
+  { verify = true, phone: fixedPhone }: { verify?: boolean; phone?: string } = {},
 ): Promise<TestUser> {
-  const phone = uniquePhone();
+  // A caller may pin the number (see `E2E_ADMIN_PHONE`): the admin specs need a
+  // phone an out-of-band grant could already have promoted, because the operator
+  // CLI is unreachable when the environment blocks child processes.
+  const phone = fixedPhone ?? uniquePhone();
 
   await page.goto("/register");
   await page.fill("#nickname", nickname);
@@ -119,14 +123,17 @@ export async function createTrip(
     title,
     description = "這是一趟由端到端測試建立的行程，說明文字需要至少十個字元才符合驗證規則。",
     country = "日本",
-    city = "東京",
+    city,
   }: { title: string; description?: string; country?: string; city?: string },
 ): Promise<string> {
   await page.goto("/trips/new");
   await page.fill("#title", title);
   await page.fill("#description", description);
   await page.fill("#country", country);
-  await page.fill("#city", city);
+  // `#city` is a button-triggered combobox, not a text field, so `fill` would
+  // fail. The city is optional, so it is left unset unless asked for; the
+  // reference rows a lookup needs come from the global setup (`app.seed`).
+  if (city) await pickCity(page, city);
 
   // The nav bar has a "發佈行程" *link*; this role-based lookup targets the
   // submit *button* and so cannot collide with it.
@@ -137,6 +144,33 @@ export async function createTrip(
 }
 
 /**
+ * Drive the select-only city picker on whichever form is open.
+ *
+ * The control is a button that opens a popover containing a search box and a
+ * listbox, so it cannot be driven with `fill`. Selecting a city must be done by
+ * *clicking a suggestion*, which is the product rule this asserts: there is no
+ * way to set an arbitrary city by typing one.
+ *
+ * Located by `#city` rather than by accessible name. The accessible name is the
+ * surrounding `<Label>` concatenated with the button's own text, and the two
+ * forms label this field differently — 「城市 / 地區（選填）」 on the trip form and
+ * 「城市 / 地區」 on the travel-history form — so an `{ name }` lookup that works
+ * on one silently times out on the other. The id is stable and unique per page.
+ */
+export async function pickCity(page: Page, query: string): Promise<void> {
+  await page.locator("#city").click();
+  const search = page.getByPlaceholder("輸入城市名稱…");
+  await expect(search).toBeVisible();
+  await search.fill(query);
+
+  // Wait for a suggestion rather than assuming the debounce has elapsed.
+  const options = page.getByRole("option");
+  await expect(options.first()).toBeVisible({ timeout: 15_000 });
+  await options.first().click();
+}
+
+
+/**
  * The notification bell's accessible name encodes the unread count
  * ("通知，3 則未讀"), which makes it a far more precise assertion target than
  * scraping the badge span.
@@ -145,20 +179,61 @@ export function bellLabel(unread: number): string {
   return unread > 0 ? `通知，${unread} 則未讀` : "通知";
 }
 
+/**
+ * Promote a phone number to ADMIN, driving the real operator CLI.
+ *
+ * There is deliberately no HTTP route that grants a role, so this is the only
+ * honest way for a test to become an administrator — it exercises the same path
+ * a real deployment uses.
+ *
+ * Fallback: some environments forbid child processes entirely. Inside the
+ * WorkBuddy sandbox **every** `spawnSync` fails with `EBUSY` (measured, with
+ * `node --version` as a control), so the CLI cannot be invoked. In that case the
+ * grant is left to `e2e/out-of-band-roles.ts`, driven by `E2E_ADMIN_PHONES`, and
+ * this function only warns — the *tests* then either pass against an
+ * already-promoted account or fail loudly, which is the correct outcome.
+ *
+ * The warning is deliberate: a green admin run under this path proves the admin
+ * UI and the audit trail work, and proves **nothing** about `manage_roles.py`.
+ * `backend/tests/test_manage_roles.py` is where that guarantee lives.
+ */
 export function promoteToAdmin(phone: string): void {
   const databaseUrl = `sqlite+aiosqlite:///${path
     .join(BACKEND_DIR, E2E_DB_FILE)
     .split(path.sep)
     .join("/")}`;
 
-  execFileSync(resolvePython(), ["scripts/manage_roles.py", "promote", phone], {
-    cwd: BACKEND_DIR,
-    env: {
-      ...process.env,
-      ENV: "development",
-      SECRET_KEY: process.env.SECRET_KEY ?? "e2e-secret-key-not-for-production",
-      DATABASE_URL: databaseUrl,
-    },
-    stdio: "pipe",
-  });
+  try {
+    execFileSync(resolvePython(), ["scripts/manage_roles.py", "promote", phone], {
+      cwd: BACKEND_DIR,
+      env: {
+        ...process.env,
+        ENV: "development",
+        SECRET_KEY: process.env.SECRET_KEY ?? "e2e-secret-key-not-for-production",
+        DATABASE_URL: databaseUrl,
+      },
+      stdio: "pipe",
+    });
+    return;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EBUSY" && code !== "EPERM") throw err;
+
+    const already = requestedAdminPhones();
+    if (already.includes(phone)) {
+      console.warn(
+        `[helpers] spawnSync blocked (${code}); ${phone} was granted ADMIN ` +
+          "out-of-band. The operator CLI was NOT exercised by this run.",
+      );
+      return;
+    }
+    throw new Error(
+      `[helpers] promoteToAdmin could not run the operator CLI: spawnSync ` +
+        `${resolvePython()} failed with ${code}, and this environment blocks ` +
+        "child processes.\n" +
+        "Grant the role out-of-band, then re-run with E2E_ADMIN_PHONES set:\n" +
+        `  cd backend && ENV=development DATABASE_URL=${databaseUrl} \\\n` +
+        `    E2E_ADMIN_PHONES="${phone}" ${resolvePython()} -m e2e_out_of_band_promote`,
+    );
+  }
 }

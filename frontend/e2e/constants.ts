@@ -17,3 +17,16 @@ export const BASE_URL = `http://127.0.0.1:${FRONTEND_PORT}`;
 
 /** Throwaway SQLite file used by the backend during the run. */
 export const E2E_DB_FILE = "e2e.db";
+
+/**
+ * Deterministic ADMIN phone for the admin specs.
+ *
+ * The specs normally promote through the operator CLI, but some environments
+ * block child processes entirely (see `e2e/out-of-band-roles.ts`). When
+ * `E2E_ADMIN_PHONES` names this number the caller has already granted ADMIN
+ * out-of-band, and `registerUser` reuses it instead of minting a random one.
+ *
+ * It must be unique per run: the E2E DB is reset at the start of each run in the
+ * normal path, so a fixed number cannot collide.
+ */
+export const E2E_ADMIN_PHONE = process.env.E2E_ADMIN_PHONE ?? "";

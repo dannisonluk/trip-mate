@@ -1,15 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { BadgeCheck, Loader2, Plus, Trash2 } from "lucide-react";
 
 import { api, errorMessage } from "@/lib/api";
 import { RequireAuth, useAuth } from "@/lib/auth";
 import { useI18n } from "@/lib/i18n";
+import { useTravelHistories } from "@/hooks/useTravelHistories";
 import { BUDGET_OPTIONS, TRAVEL_STYLE_OPTIONS, cn } from "@/lib/utils";
 import type { BudgetType, Gender, TravelHistory } from "@/lib/types";
 import AvatarUploader from "@/components/AvatarUploader";
+import { CityPicker, type CitySelection } from "@/components/CityPicker";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -47,16 +49,48 @@ function MyProfile() {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const [histories, setHistories] = useState<TravelHistory[]>([]);
+  // The list, its races and its request guards live in the hook: F3 was three
+  // separate lost-race defects in this one list, and they are only testable once
+  // the bookkeeping is out of the render body. See `useTravelHistories`.
+  const describeHistoryError = useCallback(
+    (err: unknown, op: "load" | "add" | "remove") =>
+      errorMessage(
+        err,
+        t(
+          op === "load"
+            ? "myProfile.historiesError"
+            : op === "add"
+              ? "myProfile.addError"
+              : "myProfile.deleteError",
+        ),
+        t,
+      ),
+    [t],
+  );
+  const {
+    histories,
+    adding: addingHistory,
+    busyIds: busyHistoryIds,
+    add: addHistoryEntry,
+    remove: removeHistoryEntry,
+  } = useTravelHistories({
+    profileId: profile?.id,
+    describeError: describeHistoryError,
+    onError: setNotice,
+  });
+
   const [newHistory, setNewHistory] = useState({
     country: "",
-    city: "",
     start_date: "",
     end_date: "",
     budget_type: "MODERATE" as BudgetType,
     summary: "",
     is_public: true,
   });
+  // Held outside `newHistory` for the same reason as the trip form: the city is
+  // a reference-table row, and `city` / `city_id` must be written together or
+  // the backend stores a name it cannot verify.
+  const [historyCity, setHistoryCity] = useState<CitySelection | null>(null);
 
   const [deletePassword, setDeletePassword] = useState("");
   const [deleteMode, setDeleteMode] = useState("anonymize");
@@ -69,10 +103,6 @@ function MyProfile() {
     setGender(profile.gender ?? "");
     setTags(profile.travel_style_tags ?? []);
     setLanguages((profile.languages ?? []).join(", "));
-  }, [profile]);
-
-  useEffect(() => {
-    if (profile) void api.listHistories(profile.id).then(setHistories).catch(() => {});
   }, [profile]);
 
   function toggleTag(tag: string) {
@@ -97,7 +127,7 @@ function MyProfile() {
       await refreshProfile();
       setNotice(t("myProfile.saved"));
     } catch (err) {
-      setNotice(errorMessage(err, t("myProfile.saveError")));
+      setNotice(errorMessage(err, t("myProfile.saveError"), t));
     } finally {
       setBusy(false);
     }
@@ -105,38 +135,38 @@ function MyProfile() {
 
   async function addHistory() {
     if (!newHistory.country) return;
-    setNotice(null);
-    try {
-      const payload: Record<string, unknown> = { ...newHistory };
-      if (!payload.start_date) delete payload.start_date;
-      if (!payload.end_date) delete payload.end_date;
-      if (!payload.city) delete payload.city;
-      if (!payload.summary) delete payload.summary;
 
-      const created = await api.addHistory(payload);
-      setHistories((prev) => [created, ...prev]);
-      setNewHistory({
-        country: "",
-        city: "",
-        start_date: "",
-        end_date: "",
-        budget_type: "MODERATE",
-        summary: "",
-        is_public: true,
-      });
-      setNotice(t("myProfile.historyAdded"));
-    } catch (err) {
-      setNotice(errorMessage(err, t("myProfile.addError")));
+    const payload: Record<string, unknown> = { ...newHistory };
+    if (!payload.start_date) delete payload.start_date;
+    if (!payload.end_date) delete payload.end_date;
+    if (!payload.summary) delete payload.summary;
+
+    // City and its id travel together. Leaving the city blank is allowed — it
+    // costs match score but is not an error, which is what the field hint says.
+    if (historyCity) {
+      payload.city = historyCity.name;
+      payload.city_id = historyCity.id;
     }
+
+    // The in-flight guard lives in the hook, read before its first `await`.
+    const ok = await addHistoryEntry(payload);
+    if (!ok) return;
+
+    setNewHistory({
+      country: "",
+      start_date: "",
+      end_date: "",
+      budget_type: "MODERATE",
+      summary: "",
+      is_public: true,
+    });
+    setHistoryCity(null);
+    setNotice(t("myProfile.historyAdded"));
   }
 
   async function removeHistory(id: string) {
-    try {
-      await api.deleteHistory(id);
-      setHistories((prev) => prev.filter((h) => h.id !== id));
-    } catch (err) {
-      setNotice(errorMessage(err, t("myProfile.deleteError")));
-    }
+    if (await removeHistoryEntry(id)) return;
+    // The hook reports its own failures; nothing to add here.
   }
 
   async function deleteAccount() {
@@ -316,10 +346,18 @@ function MyProfile() {
                   </div>
                   <div className="space-y-2">
                     <Label>{t("myProfile.cityLabel")}</Label>
-                    <Input
-                      value={newHistory.city}
-                      onChange={(e) => setNewHistory({ ...newHistory, city: e.target.value })}
-                      placeholder="Tokyo"
+                    {/* The hint is the point: a blank city is legal, but it
+                        silently costs the +3.0 match weight, and the user has no
+                        other way to learn that. */}
+                    <CityPicker
+                      value={historyCity}
+                      onChange={(next) => {
+                        setHistoryCity(next);
+                        // Keep the country consistent with the chosen city.
+                        if (next) setNewHistory((prev) => ({ ...prev, country: next.countryName }));
+                      }}
+                      countryCode={historyCity?.countryCode}
+                      hint={t("cityPicker.historyHint")}
                     />
                   </div>
                   <div className="space-y-2">
@@ -389,8 +427,18 @@ function MyProfile() {
                   />
                 </div>
 
-                <Button onClick={addHistory} disabled={!newHistory.country}>
-                  <Plus className="h-4 w-4" />
+                {/* `disabled` is for the user's benefit, not the guard: the
+                    in-flight check inside `addHistory` is what actually
+                    prevents the second request. */}
+                <Button
+                  onClick={addHistory}
+                  disabled={!newHistory.country || addingHistory}
+                >
+                  {addingHistory ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Plus className="h-4 w-4" />
+                  )}
                   {t("myProfile.addHistory")}
                 </Button>
               </CardContent>
@@ -429,9 +477,14 @@ function MyProfile() {
                         size="icon"
                         className="ml-auto h-8 w-8"
                         onClick={() => removeHistory(h.id)}
+                        disabled={busyHistoryIds.includes(h.id)}
                         aria-label={t("myProfile.deleteAria")}
                       >
-                        <Trash2 className="h-4 w-4" />
+                        {busyHistoryIds.includes(h.id) ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-4 w-4" />
+                        )}
                       </Button>
                     </div>
                   ))

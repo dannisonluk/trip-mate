@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { E2E_ADMIN_PHONE } from "./constants";
 import { createTrip, newUserContext, promoteToAdmin, registerUser } from "./helpers";
 
 /**
@@ -43,7 +44,9 @@ test("管理員可以處理檢舉，稽核紀錄會記下整個過程", async ({
 
   try {
     // --- Alice publishes a trip ------------------------------------------
-    const aliceUser = await registerUser(alice, "Alice Admin");
+    const aliceUser = await registerUser(alice, "Alice Admin", {
+      phone: E2E_ADMIN_PHONE || undefined,
+    });
     const tripTitle = `管理後台測試行程 ${Date.now()}`;
     // Navigate by id rather than hunting the listing: the list is paginated and
     // the database persists between runs, so "find my new trip in the list" is a
@@ -76,8 +79,15 @@ test("管理員可以處理檢舉，稽核紀錄會記下整個過程", async ({
     // and changes nothing — which is exactly what happened the first time, and
     // the audit trail is what made it visible (`status_filter=actioned`).
     const reportCard = alice.locator("li").filter({ hasText: "騷擾" }).first();
+    // The card is what actually changes: the "已處理" *button* is only rendered
+    // while `status !== "actioned"`, so its disappearance is the observable
+    // result. Asserting `getByText("已處理")` here would be a no-op that always
+    // passes — the button's own label matches it (`admin.markActioned` and
+    // `admin.statusActioned` are both 「已處理」), which is why the audit-trail
+    // assertion below is the one that caught the click not taking effect.
+    await expect(reportCard.getByRole("button", { name: "已處理" })).toBeVisible();
     await reportCard.getByRole("button", { name: "已處理" }).click();
-    await expect(reportCard.getByText("已處理")).toBeVisible();
+    await expect(reportCard.getByRole("button", { name: "已處理" })).toHaveCount(0);
 
     // --- The audit tab contains the events that just happened -------------
     await alice.getByRole("tab", { name: "稽核紀錄" }).click();
@@ -98,11 +108,60 @@ test("管理員可以處理檢舉，稽核紀錄會記下整個過程", async ({
   }
 });
 
+test("稽核紀錄：慢的舊回應不得覆蓋新回應", async ({ browser }) => {
+  const context = await newUserContext(browser);
+  const page = await context.newPage();
+  try {
+    const admin = await registerUser(page, "Race Admin", {
+      phone: E2E_ADMIN_PHONE || undefined,
+    });
+    promoteToAdmin(admin.phone);
+    await page.goto("/admin");
+
+    // The guard that makes this pass is the `requestId` ref in `AuditTrail`.
+    // Delaying only the **filtered** list makes "the last response to land" the
+    // stale one, which is the real failure mode: the viewer sees a list that
+    // predates their own filter. Without the guard the delayed stale response
+    // overwrites the fresh one and the row below never disappears.
+    //
+    // NOTE: an earlier version of this test only mutated the guard and asserted
+    // "some bad thing happens" — it passed with the guard removed, so it pinned
+    // nothing. A timing race cannot be reproduced by a mutation alone; the
+    // *delay* is what makes the stale response observable.
+    await page.route("**/admin/audit-logs**", async (route) => {
+      const url = route.request().url();
+      if (url.includes("action=ACCOUNT_ANONYMIZED")) {
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+      await route.continue();
+    });
+
+    await page.getByRole("tab", { name: "稽核紀錄" }).click();
+    await expect(page.getByText(/共 \d+ 筆紀錄/)).toBeVisible();
+
+    // The row exists to begin with.
+    await expect(page.getByText("檢視檢舉佇列").first()).toBeVisible();
+
+    // Filter to an action that has definitely happened, then immediately to one
+    // that cannot have. A second click forces a second request while the first
+    // response is still in flight.
+    await page.getByRole("button", { name: "檢視檢舉佇列" }).first().click();
+    await page.getByRole("button", { name: "帳號匿名化" }).click();
+
+    await expect(page.getByText("這個篩選條件下沒有稽核紀錄。")).toBeVisible();
+    await expect(page.getByText("檢視檢舉佇列")).toHaveCount(0);
+  } finally {
+    await context.close();
+  }
+});
+
 test("稽核紀錄可以依動作篩選", async ({ browser }) => {
   const context = await newUserContext(browser);
   const page = await context.newPage();
   try {
-    const admin = await registerUser(page, "Filter Admin");
+    const admin = await registerUser(page, "Filter Admin", {
+      phone: E2E_ADMIN_PHONE || undefined,
+    });
     promoteToAdmin(admin.phone);
     await page.goto("/admin");
     await page.getByRole("tab", { name: "稽核紀錄" }).click();

@@ -69,6 +69,10 @@ export interface TripPost {
   description: string;
   destination_country: string;
   destination_city?: string | null;
+  /** GeoNames `geonameid`, or null when the trip has no city (the field is
+   *  optional). Coordinates are resolved from this, never sent by the client;
+   *  it also becomes null if the reference row is later removed. */
+  city_id?: number | null;
   start_date?: string | null;
   end_date?: string | null;
   budget_type: BudgetType;
@@ -104,6 +108,32 @@ export interface PaginatedTrips {
   total: number;
   page: number;
   limit: number;
+}
+
+/** One city from the reference table, as returned by `GET /cities`.
+ *
+ * The extra fields beyond `name` are not decoration: `Santa Cruz` occurs 16
+ * times in the real 69,740-row table, so a suggestion list of bare names cannot
+ * be chosen from. Everything needed to tell candidates apart travels with each
+ * one. */
+export interface CitySuggestion {
+  /** GeoNames `geonameid` — the value stored as `city_id`. */
+  id: number;
+  /** Display name, with diacritics (`Sant Julià de Lòria`). */
+  name: string;
+  country_code: string;
+  country_name: string;
+  /** First-level division (`Osaka`, `California`); null for city-states. */
+  admin1_name: string | null;
+  population: number;
+  latitude: number;
+  longitude: number;
+}
+
+export interface CitySuggestionPage {
+  /** Echoed normalised term, so a client can discard superseded responses. */
+  query: string;
+  suggestions: CitySuggestion[];
 }
 
 export interface Review {
@@ -170,7 +200,15 @@ export type NotificationType =
 export interface Notification {
   id: string;
   type: NotificationType;
-  title: string;
+  /**
+   * Language-neutral key the server stores instead of a rendered sentence.
+   * Resolved through the dictionary so one row reads correctly in either
+   * language — the row outlives the locale it was written in.
+   */
+  code: string;
+  /** Values interpolated into the template. Ids and scalars only. */
+  params?: Record<string, string | number> | null;
+  /** Preview of the triggering content — already user text, shown verbatim. */
   body?: string | null;
   read_at?: string | null;
   created_at: string;

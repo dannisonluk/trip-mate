@@ -2,6 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Leaflet ships its own stylesheet (tile positioning, controls, attribution).
+   Imported globally rather than from the component because Next only allows
+   global CSS from a layout or another global sheet, and the map is one of
+   several consumers — a component-level import would fail the build. */
+@import "leaflet/dist/leaflet.css";
+
 @layer base {
   :root {
     --background: 210 20% 98%;

@@ -32,6 +32,9 @@ const NO_WEBSERVER = process.env.E2E_NO_WEBSERVER === "1";
 
 export default defineConfig({
   testDir: "./e2e",
+  // Populates `cities` in the throwaway database. See the file for why the
+  // suite needs reference data it cannot import from a 5.7 MB dump.
+  globalSetup: "./e2e/global-setup.ts",
   // Every flow shares one backend database, so run them serially.
   fullyParallel: false,
   workers: 1,

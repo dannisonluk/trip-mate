@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   AlertTriangle,
@@ -141,18 +141,61 @@ function AuditTrail({ onForbidden }: { onForbidden: () => void }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  // This list is fetched more than once, and the responses are not guaranteed to
+  // arrive in the order the requests were sent:
+  //
+  //   * `reactStrictMode` double-invokes the mount effect in development, so the
+  //     unfiltered list is requested twice with identical params;
+  //   * the filter buttons stay enabled while a request is in flight, so two
+  //     *different* filters can be requested back to back.
+  //
+  // The invariant that matters is "**the last filter the user selected wins**" —
+  // not "the last response that happens to arrive wins". Those two only agree
+  // when responses arrive in order, so the guard has to compare the *params*
+  // a response belongs to against the params currently requested, and abandon
+  // the response outright when they differ.
+  //
+  // Abandoning (rather than merely not writing state) is also what keeps this
+  // honest under React's StrictMode remount: the mount effect runs twice, and
+  // both invocations resolve on the remounted component instance — so a plain
+  // `requestId` ref, which a remount resets to 0, does not discriminate.
+  //
+  // This came from a real, reproducible E2E failure (`admin.spec.ts`): an admin
+  // actioned a report, opened the audit tab, and the entry recording their own
+  // action was missing — while the database contained it. The trace showed two
+  // `GET /admin/audit-logs` requests 400 ms apart and the newer row absent from
+  // the rendered list.
+  const requestId = useRef(0);
+  // Readable synchronously at the instant a response arrives, unlike state.
+  const paramsRef = useRef({ action, page });
+
   const load = useCallback(async () => {
+    const seq = ++requestId.current;
+    // Snapshot the params *this* request is for. Taking them from the closure is
+    // correct here; reading them from state after the await would not be.
+    const params = { action, page };
+    paramsRef.current = params;
     setLoading(true);
     setError("");
     try {
-      const res = await api.listAuditLogs({ action, page, limit: AUDIT_PAGE_SIZE });
+      const res = await api.listAuditLogs({ ...params, limit: AUDIT_PAGE_SIZE });
+      // Abandon when another request has started, or when the user has since
+      // selected different params — the latter can happen before the new `load`
+      // even runs, because setting state and re-rendering is not synchronous.
+      if (seq !== requestId.current) return;
+      if (paramsRef.current.action !== params.action) return;
+      if (paramsRef.current.page !== params.page) return;
       setEntries(res.items);
       setTotal(res.total);
     } catch (err) {
+      if (seq !== requestId.current) return;
+      if (paramsRef.current.action !== params.action) return;
+      if (paramsRef.current.page !== params.page) return;
       if (err instanceof ApiError && err.status === 403) onForbidden();
       else setError(errorMessage(err, t("admin.loadAuditError")));
     } finally {
-      setLoading(false);
+      // A superseded request must not clear the newer one's spinner.
+      if (seq === requestId.current) setLoading(false);
     }
   }, [action, page, onForbidden, t]);
 

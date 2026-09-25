@@ -9,6 +9,7 @@ import { RequireAuth } from "@/lib/auth";
 import { useI18n } from "@/lib/i18n";
 import { BUDGET_OPTIONS, TARGET_GENDER_OPTIONS, TRAVEL_STYLE_OPTIONS, cn } from "@/lib/utils";
 import type { BudgetType, TargetGender } from "@/lib/types";
+import { CityPicker, type CitySelection } from "@/components/CityPicker";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -30,16 +31,26 @@ function NewTripForm() {
     title: "",
     description: "",
     destination_country: "",
-    destination_city: "",
     start_date: "",
     end_date: "",
     budget_type: "MODERATE" as BudgetType,
     target_gender: "ANY" as TargetGender,
     looking_for_count: 1,
   });
+  // The city lives outside `form` because it is a row from the reference table,
+  // not a string: `destination_city` and `city_id` must always be written
+  // together, and two independent state slots would let them drift apart.
+  const [destinationCity, setDestinationCity] = useState<CitySelection | null>(null);
   const [tags, setTags] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // Only pass a country filter when the typed value actually looks like a name
+  // the reference table uses. A half-typed country would otherwise filter every
+  // suggestion away and look like "no such city".
+  const countryCode =
+    destinationCity?.countryCode ??
+    (form.destination_country.trim().length === 2 ? form.destination_country.trim() : undefined);
 
   function update<K extends keyof typeof form>(key: K, value: (typeof form)[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -62,12 +73,19 @@ function NewTripForm() {
       // Omit empty optionals so the API keeps them null.
       if (!payload.start_date) delete payload.start_date;
       if (!payload.end_date) delete payload.end_date;
-      if (!payload.destination_city) delete payload.destination_city;
+
+      // The city is written as a pair or not at all. Sending `destination_city`
+      // without `city_id` would store a name the backend cannot verify, which is
+      // exactly the state the select-only picker exists to prevent.
+      if (destinationCity) {
+        payload.destination_city = destinationCity.name;
+        payload.city_id = destinationCity.id;
+      }
 
       const created = await api.createTrip(payload);
       router.push(`/trips/${created.id}`);
     } catch (err) {
-      setError(errorMessage(err, t("newTrip.publishError")));
+      setError(errorMessage(err, t("newTrip.publishError"), t));
     } finally {
       setBusy(false);
     }
@@ -126,10 +144,22 @@ function NewTripForm() {
               </div>
               <div className="space-y-2">
                 <Label htmlFor="city">{t("newTrip.cityLabel")}</Label>
-                <Input
+                {/* Select-only: the city is a reference-table row or nothing.
+                    `destinationCity` feeds `city_id`, and a typed value could
+                    not be verified — which is why the free-text input was
+                    removed. Leaving it blank stays legal. */}
+                <CityPicker
                   id="city"
-                  value={form.destination_city}
-                  onChange={(e) => update("destination_city", e.target.value)}
+                  value={destinationCity}
+                  onChange={(next) => {
+                    setDestinationCity(next);
+                    // Picking a city also fills the country, so the two fields
+                    // cannot disagree. The country field stays editable because
+                    // the city may be the only thing the user knows.
+                    if (next) update("destination_country", next.countryName);
+                  }}
+                  countryCode={countryCode}
+                  hint={t("cityPicker.tripHint")}
                 />
               </div>
             </div>

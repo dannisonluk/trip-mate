@@ -4,6 +4,8 @@ import type {
   ApplicationStatus,
   AuditAction,
   ChatRoom,
+  CitySuggestionPage,
+  CitySuggestion,
   Message,
   Notification,
   NotificationPage,
@@ -30,9 +32,39 @@ export const API_PREFIX = "/api/v1";
 
 let accessToken: string | null = null;
 
+/** In-flight refresh, shared so concurrent 401s cannot replay the cookie. */
+let refreshInFlight: Promise<boolean> | null = null;
+
+/**
+ * Bumped by every explicit session change (login, register, logout).
+ *
+ * `refreshInFlight = null` only unlinks the slot; it does not stop the promise
+ * that is already awaiting `fetch`. That promise still holds a body and, when it
+ * resolves, still calls `setAccessToken(...)` — so a refresh issued under the
+ * *previous* session could reinstall that session's token after a login or
+ * logout had already moved on. Clearing the slot was never sufficient on its
+ * own, because the write happens inside the attempt, not in the caller that
+ * clears it.
+ *
+ * The generation makes "is this result still wanted?" answerable: an attempt
+ * captures the value at the moment it starts and refuses to write its token if
+ * the counter has moved since.
+ */
+let sessionGeneration = 0;
+
+/**
+ * Set (or clear) the access token.
+ *
+ * Also drops any in-flight refresh: every caller of this is an *explicit*
+ * session change (login, register, logout), and a refresh that resolves after
+ * one of those must not reinstall the previous user's token.
+ */
 export function setAccessToken(token: string | null) {
   accessToken = token;
+  refreshInFlight = null;
+  sessionGeneration += 1;
 }
+
 export function getAccessToken(): string | null {
   return accessToken;
 }
@@ -54,8 +86,22 @@ export class ApiError extends Error {
  * reach the translation hook. Every call site already knows which message fits,
  * and passing it explicitly is what keeps a hard-coded default language from
  * living in a shared library.
+ *
+ * `t` is optional and only needed when the server may answer with a structured
+ * `{code, params}` detail — the content filter does exactly that, because
+ * sending a rendered Chinese sentence would read wrong for an English-locale
+ * caller. Without `t` such a detail degrades to `fallback`, which is no worse
+ * than the pre-existing behaviour for an unrecognised shape.
  */
-export function errorMessage(err: unknown, fallback: string): string {
+export function errorMessage(
+  err: unknown,
+  fallback: string,
+  // Structural, not `MessageKey`: importing the i18n module here would make this
+  // shared HTTP client depend on the dictionary (and the harness that compiles
+  // this file standalone would have to stub it). The caller's `t` is assignable
+  // to this shape, so call sites pass `t` unchanged.
+  t?: (key: never, vars?: Record<string, string | number>) => string,
+): string {
   if (!(err instanceof ApiError)) return fallback;
   const d = err.detail;
   if (typeof d === "string") return d;
@@ -66,6 +112,18 @@ export function errorMessage(err: unknown, fallback: string): string {
     return d
       .map((item: any) => item?.msg ?? JSON.stringify(item))
       .join(" · ");
+  }
+  if (t && d && typeof d === "object" && typeof (d as { code?: unknown }).code === "string") {
+    const { code, params } = d as { code: string; params?: Record<string, string | number> };
+    // The key is resolved by name here rather than through the dictionary's
+    // table, because this module cannot import it. The prefix keeps the lookup
+    // from colliding with an unrelated key, and an unknown code falls through to
+    // `fallback` — the message must stay actionable, and a raw key is not.
+    const key = `contentRejected.${code}` as never;
+    const resolved = t(key, params);
+    // `translate` returns the key itself when it has no entry, which is how an
+    // unknown code is detected without a table to consult.
+    return resolved === (key as unknown as string) ? fallback : resolved;
   }
   return fallback;
 }
@@ -114,17 +172,48 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 }
 
 export async function tryRefresh(): Promise<boolean> {
+  // Single-flight. The backend rotates the refresh token on every success and
+  // treats a *replayed* token as compromise: it bumps the user's epoch and
+  // invalidates every session (see `auth.py::refresh`). Two concurrent callers
+  // therefore do not merely both fail — the loser destroys the winner's session
+  // and the user is logged out. That is reachable on any page that fires more
+  // than one authenticated request, because each 401 triggers its own refresh.
+  // Sharing one in-flight promise means only one request ever carries the cookie.
+  if (refreshInFlight) return refreshInFlight;
+
+  // Captured before the request, not after: the question is whether the session
+  // changed *while this attempt was outstanding*.
+  const generation = sessionGeneration;
+
+  const attempt = (async (): Promise<boolean> => {
+    try {
+      const res = await fetch(`${API_URL}${API_PREFIX}/auth/refresh`, {
+        method: "POST",
+        credentials: "include",
+      });
+      if (!res.ok) return false;
+      const data = await res.json();
+      // The guard that actually matters. `setAccessToken` cannot be used here:
+      // it bumps the generation, so calling it would invalidate the very attempt
+      // this check is protecting. Writing the token directly keeps the decision
+      // in one place — did anyone explicitly change the session while we were
+      // waiting? If so, this token belongs to a session that no longer exists.
+      if (generation !== sessionGeneration) return false;
+      accessToken = data.access_token;
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  refreshInFlight = attempt;
   try {
-    const res = await fetch(`${API_URL}${API_PREFIX}/auth/refresh`, {
-      method: "POST",
-      credentials: "include",
-    });
-    if (!res.ok) return false;
-    const data = await res.json();
-    setAccessToken(data.access_token);
-    return true;
-  } catch {
-    return false;
+    return await attempt;
+  } finally {
+    // Only clear the slot if it still holds *this* attempt. `setAccessToken`
+    // clears it eagerly on an explicit session change, and a later refresh may
+    // already have installed a new one — clearing unconditionally would drop it.
+    if (refreshInFlight === attempt) refreshInFlight = null;
   }
 }
 
@@ -184,6 +273,22 @@ export const api = {
     request<unknown>("/reports", { method: "POST", body }),
   deleteAccount: (body: { password: string; mode: string }) =>
     request<void>("/users/me", { method: "DELETE", body }),
+
+  // --- cities (reference data) ---
+  /** Ranked suggestions for a prefix. An empty `q` is legal and returns an empty
+   *  list — that is what the picker sends when the user clears the field. */
+  suggestCities: (params: { q: string; country?: string; limit?: number }) =>
+    request<CitySuggestionPage>(
+      `/cities${qs(params as Record<string, string | number | undefined>)}`,
+    ),
+
+  /** One city by GeoNames id, with its coordinates.
+   *
+   *  Distinct from `suggestCities` on purpose: a trip stores `city_id`, and
+   *  re-deriving its location from a *name* search can return a different city
+   *  with the same name. Answers 404 once the row is gone (a GeoNames re-import
+   *  can remove it), which the caller treats as "no map", not as a failure. */
+  getCity: (cityId: number) => request<CitySuggestion>(`/cities/${cityId}`),
 
   // --- trips ---
   listTrips: (filters: TripFilters = {}) =>

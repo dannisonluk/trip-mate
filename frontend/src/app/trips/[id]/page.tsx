@@ -20,6 +20,7 @@ import { useI18n } from "@/lib/i18n";
 import type { TripPostDetail } from "@/lib/types";
 import DisclaimerBanner from "@/components/DisclaimerBanner";
 import SafeHtml from "@/components/SafeHtml";
+import { CityMapLoader } from "@/components/CityMapLoader";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -89,7 +90,7 @@ function TripDetail() {
       setMessage("");
       setNotice(t("tripDetail.applied"));
     } catch (err) {
-      setNotice(errorMessage(err, t("tripDetail.applyError")));
+      setNotice(errorMessage(err, t("tripDetail.applyError"), t));
     } finally {
       setBusy(false);
     }
@@ -251,6 +252,13 @@ function TripDetail() {
             html={trip.description.replace(/\n/g, "<br/>")}
             className="text-sm leading-relaxed text-muted-foreground"
           />
+
+          {/* Optional and purely additive: renders nothing when the trip has no
+              city, and degrades to plain text when the city no longer resolves.
+              It must never be the only place the destination is stated — the
+              header already carries city + country, and the map's accessible
+              name repeats them. */}
+          <CityMapLoader cityId={trip.city_id ?? null} />
 
           {trip.creator && (
             <>

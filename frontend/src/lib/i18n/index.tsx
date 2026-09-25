@@ -29,19 +29,39 @@ import {
   htmlLang,
   intlLocale,
   labelKey,
+  serverCodeKey,
   translate,
   type LabelGroup,
   type Locale,
   type MessageKey,
 } from "./dictionaries";
 
-interface I18nState {
+// Re-exported so a component takes one import for its i18n needs, and so the
+// server-code table has exactly one home. `serverCodeKey` in particular must not
+// be re-implemented at a call site: a template-literal key would bypass the
+// table and quietly defeat the typed dictionary.
+export { serverCodeKey, type MessageKey } from "./dictionaries";
+
+export interface I18nState {
   locale: Locale;
   setLocale: (next: Locale) => void;
   /** Translate a key, interpolating `{name}` placeholders. */
   t: (key: MessageKey, vars?: Record<string, string | number>) => string;
   /** Display label for a server-supplied enum value; falls back to the raw value. */
   label: (group: LabelGroup, value: string | null | undefined) => string;
+  /**
+   * Compose a sentence from a server-supplied notification `code` + `params`.
+   *
+   * Lives here rather than in each component because the two surfaces that show
+   * notifications (the bell and the page) must agree, and an unknown code must
+   * degrade the same way in both. Returns the raw code when this build does not
+   * know it — visible, so a version mismatch looks wrong rather than blank.
+   */
+  serverText: (
+    prefix: string,
+    code: string,
+    params?: Record<string, string | number> | null,
+  ) => string;
   formatDate: (value?: string | null, opts?: Intl.DateTimeFormatOptions) => string | null;
   formatDateTime: (value?: string | null) => string;
 }
@@ -95,6 +115,13 @@ export function LocaleProvider({ children }: { children: React.ReactNode }) {
       label: (group, raw) => {
         const key = labelKey(group, raw);
         return key ? translate(locale, key) : (raw ?? "");
+      },
+      serverText: (prefix, code, params) => {
+        const key = serverCodeKey(`${prefix}.${code}`);
+        // No entry for this code: show the code. Blank would read as a
+        // rendering failure; the raw code tells a developer what happened.
+        if (!key) return code;
+        return translate(locale, key, params ?? undefined);
       },
       formatDate: (input, opts) =>
         input

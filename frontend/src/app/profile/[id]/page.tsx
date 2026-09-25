@@ -143,7 +143,7 @@ function ProfileDetail() {
       await load();
       setNotice(t("profileView.reviewSent"));
     } catch (err) {
-      setNotice(errorMessage(err, t("profileView.reviewError")));
+      setNotice(errorMessage(err, t("profileView.reviewError"), t));
     } finally {
       setBusy(false);
     }

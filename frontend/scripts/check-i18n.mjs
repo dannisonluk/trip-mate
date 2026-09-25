@@ -47,9 +47,14 @@ function walk(dir, out = []) {
 const problems = [];
 
 // --- 1. no stray literals ---------------------------------------------------
+//
+// The dictionaries were split into `src/lib/i18n/namespaces/` (D5). Those files
+// are *where the translations live*, so they are the one legitimate home for
+// CJK — the same exemption the monolithic `dictionaries.ts` used to have.
 for (const file of walk(SRC)) {
-  const rel = relative(ROOT, file);
-  if (rel.split(sep).join("/") === DICTIONARY.split(sep).join("/")) continue;
+  const rel = relative(ROOT, file).split(sep).join("/");
+  if (rel === DICTIONARY.split(sep).join("/")) continue;
+  if (rel.startsWith("src/lib/i18n/namespaces/")) continue;
 
   const lines = readFileSync(file, "utf8").split("\n");
   lines.forEach((line, index) => {
@@ -62,24 +67,71 @@ for (const file of walk(SRC)) {
 }
 
 // --- 2. key parity ---------------------------------------------------------
-const source = readFileSync(join(ROOT, DICTIONARY), "utf8");
+//
+// The dictionary was split per feature (D5), so the keys now live in
+// `src/lib/i18n/namespaces/*.ts` and `dictionaries.ts` only composes them.
+// This walks the namespace files directly.
+//
+// Reading the *files* rather than importing them matters: the point of this
+// check is to validate the source, and importing would evaluate the module
+// (needing a TS loader, and a compile error would surface as an import crash
+// rather than a readable problem).
+const NAMESPACES_DIR = join(ROOT, "src", "lib", "i18n", "namespaces");
 
-function keysOf(startMarker, endMarker) {
-  const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker, start);
-  if (start === -1 || end === -1) {
-    throw new Error(`could not locate the ${startMarker} block in dictionaries.ts`);
+const namespaceFiles = readdirSync(NAMESPACES_DIR)
+  .filter((f) => f.endsWith(".ts"))
+  .sort();
+
+if (!namespaceFiles.length) {
+  throw new Error(`no namespace files found in ${NAMESPACES_DIR}`);
+}
+
+/** Pull the `"key": "value",` pairs from one exported object literal. */
+function keysOf(text, startMarker) {
+  const start = text.indexOf(startMarker);
+  if (start === -1) {
+    throw new Error(`could not locate the ${startMarker} block`);
   }
-  return source
-    .slice(start, end)
+  // Walk braces so a value containing `}` cannot end the block early.
+  let i = text.indexOf("{", start) + 1;
+  let depth = 1;
+  const chunk = [];
+  while (depth > 0 && i < text.length) {
+    if (text[i] === "{") depth += 1;
+    if (text[i] === "}") depth -= 1;
+    if (depth > 0) chunk.push(text[i]);
+    i += 1;
+  }
+  return chunk
+    .join("")
     .split("\n")
-    .map((line) => line.match(/^\s{2}"([^"]+)":/))
+    .map((line) => line.match(/^\s*"([^"]+)":/))
     .filter(Boolean)
     .map((m) => m[1]);
 }
 
-const zh = keysOf("const zhHK = {", "} as const;");
-const en = keysOf("const en: Record<MessageKey, string> = {", "\n};");
+const zh = [];
+const en = [];
+for (const file of namespaceFiles) {
+  const text = readFileSync(join(NAMESPACES_DIR, file), "utf8");
+  zh.push(...keysOf(text, "export const zhHK = {"));
+  en.push(...keysOf(text, "export const en = {"));
+}
+
+// The composer must reference every namespace file. A file on disk that is
+// never merged is a silently dead translation set — the keys exist, `tsc` is
+// happy, and the UI renders the raw key string.
+{
+  const composer = readFileSync(join(ROOT, DICTIONARY), "utf8");
+  const unwired = namespaceFiles
+    .map((f) => f.replace(/\.ts$/, ""))
+    .filter((name) => !new RegExp(`from "\\./namespaces/${name}"`).test(composer));
+  if (unwired.length) {
+    problems.push(
+      `namespace files exist but are not imported by dictionaries.ts: ${unwired.join(", ")}`,
+    );
+  }
+}
 
 const duplicates = zh.filter((key, i) => zh.indexOf(key) !== i);
 if (duplicates.length) problems.push(`duplicate keys in zh-HK: ${duplicates.join(", ")}`);
@@ -98,19 +150,22 @@ if (extraInEn.length) problems.push(`not present in zh-HK: ${extraInEn.join(", "
 // extraction (all speculative `common.*` entries), so this is checked rather
 // than trusted.
 //
-// The two locale tables are *definitions*, not usages, so they are stripped
-// first. What remains of the dictionary file — `LABEL_KEYS` and the helpers — is
-// a genuine reference site, as is every other source file.
-const sourceFiles = walk(SRC).filter(
-  (file) => relative(ROOT, file).split(sep).join("/") !== DICTIONARY.split(sep).join("/"),
-);
+// The namespace files are *definitions*, not usages, so they are excluded —
+// including them would let every key reference itself and no key could ever be
+// reported unused.
+//
+// `dictionaries.ts` is *included*: after the D5 split it no longer holds the
+// strings, and it is a genuine reference site for every key that appears in
+// `LABEL_KEYS` or `SERVER_CODES`. Its spread-merge lines name the namespaces
+// rather than the keys, so they contribute nothing either way.
+const sourceFiles = walk(SRC).filter((file) => {
+  const rel = relative(ROOT, file).split(sep).join("/");
+  return !rel.startsWith("src/lib/i18n/namespaces/");
+});
 
-const referenceCorpus = [
-  ...sourceFiles.map((file) => readFileSync(file, "utf8")),
-  source
-    .replace(/const zhHK = \{[\s\S]*?\n\} as const;/, "")
-    .replace(/const en: Record<MessageKey, string> = \{[\s\S]*?\n\};/, ""),
-].join("\n");
+const referenceCorpus = sourceFiles
+  .map((file) => readFileSync(file, "utf8"))
+  .join("\n");
 
 const unused = zh.filter((key) => !referenceCorpus.includes(`"${key}"`));
 if (unused.length) {

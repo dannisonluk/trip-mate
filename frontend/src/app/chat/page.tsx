@@ -4,9 +4,10 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { useSearchParams } from "next/navigation";
 import { Loader2, MessageSquarePlus, Send, ShieldAlert, Users, Wifi, WifiOff } from "lucide-react";
 
-import { API_PREFIX, WS_URL, api, errorMessage, getAccessToken } from "@/lib/api";
+import { api, errorMessage } from "@/lib/api";
 import { RequireAuth, useAuth } from "@/lib/auth";
 import { useI18n } from "@/lib/i18n";
+import { useRoomSocket } from "@/hooks/useRoomSocket";
 import { cn } from "@/lib/utils";
 import type { MessageKey } from "@/lib/i18n/dictionaries";
 import type { ChatRoom, Message, RoomMember } from "@/lib/types";
@@ -17,8 +18,6 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 
-/** A message arriving over the wire may omit server-only fields. */
-type WireMessage = Partial<Message> & { type?: string };
 
 function otherMember(room: ChatRoom, myProfileId?: string): RoomMember | null {
   return room.members.find((m) => m.profile_id !== myProfileId) ?? room.members[0] ?? null;
@@ -45,27 +44,16 @@ function ChatInner() {
   const [rooms, setRooms] = useState<ChatRoom[]>([]);
   const [roomsLoading, setRoomsLoading] = useState(true);
   const [activeRoomId, setActiveRoomId] = useState<string | null>(initialRoom);
-  const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
-  const [status, setStatus] = useState<"idle" | "connecting" | "open" | "closed">("idle");
-  const [online, setOnline] = useState<string[]>([]);
-  const [peerTyping, setPeerTyping] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const socketRef = useRef<WebSocket | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
-  const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Tracks whether the current socket ever reached OPEN. A handshake rejected by
-  // the server (bad token / non-member) surfaces in the browser as a close with
-  // code 1006 — never 1008 — so "closed without ever opening" is the reliable
-  // signal that the connection was refused rather than dropped mid-session.
-  const openedRef = useRef(false);
 
   const myProfileId = profile?.id;
 
-  // `t` changes with the locale. Listing it on the socket effect below would
-  // tear the connection down and rebuild it on a language switch, so the
-  // handlers read it through a ref instead: always current, never a re-subscribe.
+  // `t` changes with the locale. Passing it straight into the socket hook would
+  // rebuild the connection on a language switch, so the hook receives a
+  // ref-backed reader: always current, never a re-subscribe. See `useRoomSocket`.
   const tRef = useRef(t);
   useEffect(() => {
     tRef.current = t;
@@ -87,117 +75,26 @@ function ChatInner() {
     void loadRooms();
   }, [loadRooms]);
 
-  // Load history, then open the socket whenever the active room changes.
-  useEffect(() => {
-    if (!activeRoomId) return;
+  const resolve = useCallback(
+    (key: MessageKey, vars?: Record<string, string | number>) => tRef.current(key, vars),
+    [],
+  );
+  // The hook owns the message list; this page only renders it. `onHistory` is
+  // therefore a no-op — it exists so a future caller can hook the transition
+  // without the hook needing another option.
+  const handleHistory = useCallback(() => {}, []);
+  const handleNotice = useCallback((text: string) => setNotice(text), []);
 
-    let cancelled = false;
-    setMessages([]);
-    setOnline([]);
-    setPeerTyping(false);
-
-    api
-      .listMessages(activeRoomId)
-      .then((res) => {
-        if (!cancelled) setMessages(res.items);
-      })
-      .catch((err) => {
-        if (!cancelled) setNotice(errorMessage(err, tRef.current("chat.loadMessagesError")));
-      });
-
-    const token = getAccessToken();
-    if (!token) {
-      setStatus("closed");
-      return;
-    }
-
-    setStatus("connecting");
-    openedRef.current = false;
-    const ws = new WebSocket(
-      `${WS_URL}${API_PREFIX}/ws/chat/${activeRoomId}?token=${encodeURIComponent(token)}`,
-    );
-    socketRef.current = ws;
-
-    ws.onopen = () => {
-      openedRef.current = true;
-      setStatus("open");
-    };
-    ws.onclose = (event) => {
-      setStatus("closed");
-      if (!openedRef.current) {
-        // Rejected during the handshake (server closes before accept → the
-        // browser reports 1006/1008 depending on transport).
-        setNotice(
-          event.code === 1008
-            ? tRef.current("chat.wsForbidden")
-            : tRef.current("chat.wsFailed"),
-        );
-      }
-    };
-    ws.onerror = () => setStatus("closed");
-
-    ws.onmessage = (event) => {
-      let data: WireMessage;
-      try {
-        data = JSON.parse(event.data);
-      } catch {
-        return;
-      }
-
-      switch (data.type) {
-        case "message": {
-          const incoming = data as Message;
-          setMessages((prev) =>
-            prev.some((m) => m.id === incoming.id) ? prev : [...prev, incoming],
-          );
-          break;
-        }
-        case "presence":
-          setOnline((data as unknown as { online?: string[] }).online ?? []);
-          break;
-        case "typing":
-          setPeerTyping(Boolean((data as unknown as { is_typing?: boolean }).is_typing));
-          break;
-        case "safety_hint":
-          setNotice((data as unknown as { detail?: string }).detail ?? null);
-          break;
-        case "error": {
-          const detail = (data as unknown as { detail?: string; code?: string }).detail;
-          const code = (data as unknown as { code?: string }).code ?? "";
-          setNotice(detail ?? tRef.current("chat.sendFailed", { code }));
-          break;
-        }
-        default:
-          break;
-      }
-    };
-
-    // Heartbeat keeps intermediaries from dropping an idle connection.
-    const ping = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
-    }, 25000);
-
-    return () => {
-      cancelled = true;
-      clearInterval(ping);
-      ws.close();
-      socketRef.current = null;
-    };
-  }, [activeRoomId]);
+  const { status, messages, online, peerTyping, send, notifyTyping } = useRoomSocket({
+    roomId: activeRoomId,
+    resolve,
+    onHistory: handleHistory,
+    onNotice: handleNotice,
+  });
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
-
-  // Auto-clear the "peer is typing" hint shortly after the last event.
-  useEffect(() => {
-    if (!peerTyping) return;
-    if (typingTimer.current) clearTimeout(typingTimer.current);
-    typingTimer.current = setTimeout(() => setPeerTyping(false), 3000);
-    return () => {
-      if (typingTimer.current) clearTimeout(typingTimer.current);
-    };
-  }, [peerTyping]);
 
   const activeRoom = useMemo(
     () => rooms.find((r) => r.id === activeRoomId) ?? null,
@@ -207,19 +104,10 @@ function ChatInner() {
   const peer = activeRoom ? otherMember(activeRoom, myProfileId) : null;
   const peerOnline = Boolean(peer && online.includes(peer.profile_id));
 
-  function send() {
-    const content = draft.trim();
-    const ws = socketRef.current;
-    if (!content || !ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "message", content }));
-    setDraft("");
-  }
-
-  function notifyTyping() {
-    const ws = socketRef.current;
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "typing", is_typing: true }));
-    }
+  function handleSend() {
+    // The draft is cleared only when the socket actually accepted the message;
+    // clearing first would discard the user's text on a mid-send disconnect.
+    if (send(draft.trim())) setDraft("");
   }
 
   return (
@@ -418,14 +306,14 @@ function ChatInner() {
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
-                      send();
+                      handleSend();
                     }
                   }}
                   placeholder={t("chat.composerPlaceholder")}
                   maxLength={4000}
                   className="flex-1"
                 />
-                <Button onClick={send} disabled={status !== "open" || !draft.trim()}>
+                <Button onClick={handleSend} disabled={status !== "open" || !draft.trim()}>
                   <Send className="h-4 w-4" />
                   {t("chat.send")}
                 </Button>

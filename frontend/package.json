@@ -10,6 +10,9 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "check:i18n": "node scripts/check-i18n.mjs",
+    "check:refresh": "node scripts/check-refresh-generation.mjs",
+    "check:ws-guard": "node scripts/check-ws-socket-guard.mjs",
+    "check:profile-history": "node scripts/check-profile-history-guard.mjs",
     "check:prod": "node scripts/check-prod.mjs",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui"
@@ -23,13 +26,16 @@
     "@radix-ui/react-separator": "^1.1.0",
     "@radix-ui/react-slot": "^1.1.0",
     "@radix-ui/react-tabs": "^1.1.1",
+    "@types/leaflet": "^1.9.12",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
     "isomorphic-dompurify": "^2.16.0",
+    "leaflet": "^1.9.4",
     "lucide-react": "^0.454.0",
     "next": "14.2.35",
     "react": "18.3.1",
     "react-dom": "18.3.1",
+    "react-leaflet": "^4.2.1",
     "tailwind-merge": "^2.5.4"
   },
   "devDependencies": {
